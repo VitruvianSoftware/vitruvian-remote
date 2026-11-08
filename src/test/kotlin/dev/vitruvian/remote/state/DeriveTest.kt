@@ -1,0 +1,1287 @@
+// Copyright (c) 2026 VitruvianSoftware
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+package dev.vitruvian.remote.state
+
+import dev.vitruvian.remote.state.Derive.PeekRegion
+import dev.vitruvian.remote.state.Derive.PollPage
+import dev.vitruvian.remote.state.Derive.PollSource
+import dev.vitruvian.remote.state.Derive.PollView
+import dev.vitruvian.remote.state.Derive.PrCheck
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** What the v1.2 rows are coloured by. Each of these was a wrong colour waiting to happen. */
+public class DeriveTest {
+
+  // --- pairing: reachable is not the same as allowed ---------------------
+
+  @Test
+  public fun `a blank token on a reachable Mac is not paired, not connected`() {
+    // The incident: the agent answered every read, so the app said "connected" while
+    // every act was refused.
+    val p = Derive.pairing(hasAgent = true, hasToken = false, rejected = false)
+    assertEquals(Derive.Pairing.NotPaired, p)
+    assertTrue(Derive.needsPairing(p))
+    assertEquals("connected · not paired", Derive.connectionWord(p, "connected"))
+  }
+
+  @Test
+  public fun `a refused token reads as rejected until a pairing succeeds`() {
+    assertEquals(
+        Derive.Pairing.Rejected, Derive.pairing(hasAgent = true, hasToken = false, rejected = true))
+    // A fresh token clears the stale refusal without anyone resetting the flag.
+    val after = Derive.pairing(hasAgent = true, hasToken = true, rejected = true)
+    assertEquals(Derive.Pairing.Paired, after)
+    assertFalse(Derive.needsPairing(after))
+    assertEquals("connected", Derive.connectionWord(after, "connected"))
+  }
+
+  @Test
+  public fun `no agent means simulated, which needs no pairing banner`() {
+    val p = Derive.pairing(hasAgent = false, hasToken = false, rejected = true)
+    assertEquals(Derive.Pairing.NoAgent, p)
+    assertFalse(Derive.needsPairing(p))
+    assertEquals(null, Derive.pairingBanner(p, "atlas"))
+  }
+
+  @Test
+  public fun `the banner names the Mac and says changes will not work`() {
+    val (label, body) = Derive.pairingBanner(Derive.Pairing.NotPaired, "atlas")!!
+    assertEquals("Not paired with atlas", label)
+    assertEquals(
+        "This phone is not paired with atlas. You can look, but changes will not work.", body)
+    val (rLabel, rBody) = Derive.pairingBanner(Derive.Pairing.Rejected, "atlas")!!
+    assertTrue(rLabel.contains("atlas"))
+    assertTrue(rBody.contains("pair again"))
+    assertEquals(null, Derive.pairingBanner(Derive.Pairing.Paired, "atlas"))
+    assertEquals("Not paired with atlas — pair to make changes", Derive.notPairedText("atlas"))
+  }
+
+  // --- phone bridge: on is not the same as linked --------------------------
+
+  private fun bridge(
+      enabled: Boolean = true,
+      linked: Boolean = false,
+      pairing: Derive.Pairing = Derive.Pairing.Paired,
+      reachable: Boolean = true,
+      status: String = "",
+  ) = Derive.bridgeProblem(enabled, linked, pairing, reachable, status)
+
+  @Test
+  public fun `a bridge that is off or linked has nothing to say`() {
+    assertEquals(Derive.BridgeProblem.None, bridge(enabled = false, status = "off"))
+    assertEquals(Derive.BridgeProblem.None, bridge(linked = true, status = "linked"))
+    assertEquals(null, Derive.bridgeProblemText(Derive.BridgeProblem.None, "atlas", "linked"))
+  }
+
+  @Test
+  public fun `an unpaired phone's bridge says not paired, from either side`() {
+    // The phone knows before the service does: it re-reads the token between attempts.
+    assertEquals(
+        Derive.BridgeProblem.NotPaired,
+        bridge(pairing = Derive.Pairing.NotPaired, status = "connecting to atlas…"))
+    // The service's own refusal, and the Mac's 401 as AgentClient words it.
+    assertEquals(
+        Derive.BridgeProblem.NotPaired,
+        bridge(status = "not paired with atlas — pair on the Hosts screen"))
+    assertEquals(Derive.BridgeProblem.NotPaired, bridge(status = "not paired (HTTP 401)"))
+    assertEquals(
+        "Phone Bridge is on but cannot link: this phone is not paired with atlas.",
+        Derive.bridgeProblemText(Derive.BridgeProblem.NotPaired, "atlas", ""))
+  }
+
+  @Test
+  public fun `a stopped service and an unreachable Mac are told apart`() {
+    assertEquals(Derive.BridgeProblem.Stopped, bridge(status = "off"))
+    assertEquals(
+        Derive.BridgeProblem.Unreachable, bridge(reachable = false, status = "connect timed out"))
+    assertEquals(Derive.BridgeProblem.Other, bridge(status = "the Mac closed the link"))
+    assertEquals(
+        "Phone Bridge is on but not linked: the Mac closed the link",
+        Derive.bridgeProblemText(Derive.BridgeProblem.Other, "atlas", "the Mac closed the link"))
+  }
+
+  @Test
+  public fun `connecting shows on the plate but does not raise the banner`() {
+    val p = bridge(status = "connecting to atlas…")
+    assertEquals(Derive.BridgeProblem.Connecting, p)
+    assertFalse(Derive.bridgeProblemIsBannerWorthy(p))
+    // The moment between the switch and the service's first word is not "stopped".
+    assertEquals(Derive.BridgeProblem.Connecting, bridge(status = "starting…"))
+    assertTrue(Derive.bridgeProblemIsBannerWorthy(Derive.BridgeProblem.NotPaired))
+    assertTrue(Derive.bridgeProblemIsBannerWorthy(Derive.BridgeProblem.Stopped))
+  }
+
+  // --- module row layout -------------------------------------------------
+
+  @Test
+  public fun `a lone switch sits in the row`() {
+    assertEquals(
+        Derive.RowControl.InlineToggle,
+        Derive.rowControl(hasToggle = true, actionCount = 0, choiceCount = 0, hasPrompt = false))
+  }
+
+  @Test
+  public fun `a lone dropdown, prompt or action sits in the row`() {
+    assertEquals(
+        Derive.RowControl.InlineDropdown,
+        Derive.rowControl(hasToggle = false, actionCount = 0, choiceCount = 8, hasPrompt = false))
+    assertEquals(
+        Derive.RowControl.InlinePrompt,
+        Derive.rowControl(hasToggle = false, actionCount = 0, choiceCount = 0, hasPrompt = true))
+    assertEquals(
+        Derive.RowControl.InlineAction,
+        Derive.rowControl(hasToggle = false, actionCount = 1, choiceCount = 0, hasPrompt = false))
+  }
+
+  @Test
+  public fun `more than one control goes under the row`() {
+    // Announce at a set volume, switched on: switch + -10/+10 + the percent dropdown.
+    assertEquals(
+        Derive.RowControl.Stacked,
+        Derive.rowControl(hasToggle = true, actionCount = 2, choiceCount = 5, hasPrompt = false))
+    // Speaker: Remove + the speaker dropdown.
+    assertEquals(
+        Derive.RowControl.Stacked,
+        Derive.rowControl(hasToggle = false, actionCount = 1, choiceCount = 3, hasPrompt = false))
+    // Two actions, no dropdown.
+    assertEquals(
+        Derive.RowControl.Stacked,
+        Derive.rowControl(hasToggle = false, actionCount = 2, choiceCount = 0, hasPrompt = false))
+  }
+
+  @Test
+  public fun `a row with nothing to press has no control`() {
+    assertEquals(
+        Derive.RowControl.None,
+        Derive.rowControl(hasToggle = false, actionCount = 0, choiceCount = 0, hasPrompt = false))
+  }
+
+  @Test
+  public fun `the switch replaces on and off but not a value`() {
+    assertEquals("", Derive.toggleTrailing("on"))
+    assertEquals("", Derive.toggleTrailing("off"))
+    assertEquals("", Derive.toggleTrailing(" On "))
+    assertEquals("60%", Derive.toggleTrailing("60%"))
+    assertEquals("running", Derive.toggleTrailing("running"))
+    assertEquals("muted", Derive.toggleTrailing("muted"))
+  }
+
+  @Test
+  public fun `an empty secret says Set, not Replace`() {
+    // The rows' trailing text is "missing" when empty; the label must not read it as a value.
+    assertEquals("Set…", Derive.promptButtonLabel(secret = true, hasValue = false))
+    assertEquals("Replace…", Derive.promptButtonLabel(secret = true, hasValue = true))
+    assertEquals("Set…", Derive.promptButtonLabel(secret = false, hasValue = false))
+    assertEquals("Edit…", Derive.promptButtonLabel(secret = false, hasValue = true))
+  }
+
+  // --- peek zoom ---------------------------------------------------------
+
+  @Test
+  public fun `no pinch is the same region`() {
+    assertEquals(PeekRegion.Full, Derive.zoomedRegion(PeekRegion.Full, 1f, 0f, 0f, 1000, 300))
+  }
+
+  @Test
+  public fun `pinching to 2x about the corner is the top-left quarter`() {
+    val r = Derive.zoomedRegion(PeekRegion.Full, 2f, 0f, 0f, 1000, 300)
+    assertEquals(PeekRegion(0.0, 0.0, 0.5, 0.5), r)
+    assertEquals(2.0, r.zoom, 1e-9)
+  }
+
+  @Test
+  public fun `pinching 2x about the centre is the middle`() {
+    // Scaling about the centre of a 1000x300 view moves the origin by half the growth.
+    val r = Derive.zoomedRegion(PeekRegion.Full, 2f, -500f, -150f, 1000, 300)
+    assertEquals(0.25, r.x, 1e-9)
+    assertEquals(0.25, r.y, 1e-9)
+    assertEquals(0.5, r.w, 1e-9)
+  }
+
+  @Test
+  public fun `a second pinch zooms into the current region, not the whole display`() {
+    val quarter = PeekRegion(0.5, 0.5, 0.5, 0.5)
+    val r = Derive.zoomedRegion(quarter, 2f, 0f, 0f, 1000, 300)
+    assertEquals(PeekRegion(0.5, 0.5, 0.25, 0.25), r)
+  }
+
+  @Test
+  public fun `panning past the edge stops at the edge`() {
+    // Dragged far to the right and down at 2x: the window would start past 1.0.
+    val r = Derive.zoomedRegion(PeekRegion.Full, 2f, -5000f, -5000f, 1000, 300)
+    assertEquals(PeekRegion(0.5, 0.5, 0.5, 0.5), r)
+    // And far the other way: never negative.
+    assertEquals(
+        PeekRegion(0.0, 0.0, 0.5, 0.5),
+        Derive.zoomedRegion(PeekRegion.Full, 2f, 5000f, 5000f, 1000, 300))
+  }
+
+  @Test
+  public fun `zoom is capped at the agent's 16x`() {
+    val r = Derive.zoomedRegion(PeekRegion.Full, 40f, 0f, 0f, 1000, 300)
+    assertEquals(PeekRegion.MIN_FRACTION, r.w, 1e-9)
+    assertEquals(PeekRegion.MIN_FRACTION, r.h, 1e-9)
+  }
+
+  @Test
+  public fun `pinching out past 1x asks for the whole display`() {
+    val quarter = PeekRegion(0.5, 0.5, 0.5, 0.5)
+    assertEquals(PeekRegion.Full, Derive.zoomedRegion(quarter, 0.4f, 0f, 0f, 1000, 300))
+    assertTrue(Derive.zoomedRegion(quarter, 0.4f, 0f, 0f, 1000, 300).isFull)
+  }
+
+  @Test
+  public fun `a view that has not measured yet changes nothing`() {
+    assertEquals(PeekRegion.Full, Derive.zoomedRegion(PeekRegion.Full, 3f, 0f, 0f, 0, 0))
+  }
+
+  @Test
+  public fun `all checks passing is green`() {
+    assertEquals(
+        PrCheck.Green, Derive.prCheck(isDraft = false, success = 12, failure = 0, pending = 0))
+  }
+
+  @Test
+  public fun `one failure outranks every success`() {
+    assertEquals(
+        PrCheck.Red, Derive.prCheck(isDraft = false, success = 40, failure = 1, pending = 0))
+  }
+
+  @Test
+  public fun `a failure outranks a pending check too`() {
+    assertEquals(
+        PrCheck.Red, Derive.prCheck(isDraft = false, success = 0, failure = 1, pending = 9))
+  }
+
+  @Test
+  public fun `still running is pending, not green`() {
+    assertEquals(
+        PrCheck.Pending, Derive.prCheck(isDraft = false, success = 11, failure = 0, pending = 1))
+  }
+
+  @Test
+  public fun `a draft stays a draft however green it is`() {
+    assertEquals(
+        PrCheck.Draft, Derive.prCheck(isDraft = true, success = 12, failure = 0, pending = 0))
+    assertEquals(
+        PrCheck.Draft, Derive.prCheck(isDraft = true, success = 0, failure = 3, pending = 0))
+  }
+
+  @Test
+  public fun `no checks at all is not success`() {
+    assertEquals(
+        PrCheck.None, Derive.prCheck(isDraft = false, success = 0, failure = 0, pending = 0))
+    assertEquals("no checks", PrCheck.None.label)
+  }
+
+  private data class App(val name: String, val sync: String, val health: String)
+
+  @Test
+  public fun `argo split keeps the broken ones and counts the rest`() {
+    val apps =
+        listOf(
+            App("a", "Synced", "Healthy"),
+            App("b", "OutOfSync", "Healthy"),
+            App("c", "Synced", "Degraded"),
+            App("d", "Synced", "Healthy"),
+            App("e", "Synced", "Healthy"),
+        )
+    val split = Derive.splitArgo(apps) { Derive.argoOk(it.sync, it.health) }
+    assertEquals(listOf("b", "c"), split.attention.map { it.name })
+    assertEquals(3, split.restCount)
+  }
+
+  @Test
+  public fun `argo split preserves the order it was given`() {
+    val apps = listOf(App("z", "OutOfSync", "Healthy"), App("a", "Unknown", "Missing"))
+    val split = Derive.splitArgo(apps) { Derive.argoOk(it.sync, it.health) }
+    assertEquals(listOf("z", "a"), split.attention.map { it.name })
+    assertEquals(0, split.restCount)
+  }
+
+  @Test
+  public fun `sync and health are matched case-insensitively`() {
+    assertTrue(Derive.argoOk("synced", "healthy"))
+    assertFalse(Derive.argoOk("Synced", "Progressing"))
+    assertFalse(Derive.argoOk("", ""))
+  }
+
+  @Test
+  public fun `the collapsed row does not say one more all`() {
+    assertEquals("47 more, all Synced · Healthy", Derive.collapsedArgoLabel(47))
+    assertEquals("1 more, Synced · Healthy", Derive.collapsedArgoLabel(1))
+  }
+
+  @Test
+  public fun `session states are shortened, and unknown ones survive`() {
+    assertEquals("waiting", Derive.claudeStateLabel("waiting_for_permission"))
+    assertEquals("working", Derive.claudeStateLabel("working"))
+    assertEquals("idle", Derive.claudeStateLabel("IDLE"))
+    assertEquals("unknown", Derive.claudeStateLabel(""))
+    assertEquals("compacting", Derive.claudeStateLabel("compacting"))
+  }
+
+  @Test
+  public fun `only waiting for permission counts as waiting`() {
+    assertTrue(Derive.claudeWaiting("waiting_for_permission"))
+    assertFalse(Derive.claudeWaiting("working"))
+    assertFalse(Derive.claudeWaiting("waiting"))
+  }
+
+  // --- HomeSpeaker ---------------------------------------------------------
+
+  @Test
+  public fun `the speaker's worst problem is the status, never a cheerful on`() {
+    assertEquals("not installed", Derive.homeSpeakerStatus(false, false, false, true, true))
+    assertEquals("not set up", Derive.homeSpeakerStatus(false, true, false, true, true))
+    assertEquals("not signed in", Derive.homeSpeakerStatus(true, true, false, true, true))
+    assertEquals("off", Derive.homeSpeakerStatus(true, true, true, false, true))
+    assertEquals("on · app closed", Derive.homeSpeakerStatus(true, true, true, true, false))
+    assertEquals("on", Derive.homeSpeakerStatus(true, true, true, true, true))
+  }
+
+  @Test
+  public fun `a speaker that cannot speak is a problem even when switched on`() {
+    assertEquals(Derive.SpeakerHealth.Problem, Derive.homeSpeakerHealth(true, true, false, true))
+    assertEquals(Derive.SpeakerHealth.Off, Derive.homeSpeakerHealth(true, true, true, false))
+    assertEquals(Derive.SpeakerHealth.Ok, Derive.homeSpeakerHealth(true, true, true, true))
+  }
+
+  @Test
+  public fun `the outputs line names what will speak`() {
+    assertEquals(
+        "Lake Office display + This Mac",
+        Derive.homeSpeakerOutputs(true, true, "Lake Office display"))
+    assertEquals(
+        "Lake Office display", Derive.homeSpeakerOutputs(true, false, "Lake Office display"))
+    assertEquals("This Mac only", Derive.homeSpeakerOutputs(false, true, "Lake Office display"))
+    assertEquals(
+        "No outputs — nothing will be spoken",
+        Derive.homeSpeakerOutputs(false, false, "Lake Office display"))
+    // No speaker picked is said, not left blank.
+    assertEquals("no speaker + This Mac", Derive.homeSpeakerOutputs(true, true, null))
+    assertEquals("no speaker", Derive.homeSpeakerOutputs(true, false, " "))
+    assertEquals(
+        "This phone only",
+        Derive.homeSpeakerOutputs(false, false, "Lake Office display", speakPhone = true))
+    assertEquals(
+        "Lake Office display + This phone",
+        Derive.homeSpeakerOutputs(true, false, "Lake Office display", speakPhone = true))
+    assertEquals(
+        "Lake Office display + This Mac + This phone",
+        Derive.homeSpeakerOutputs(true, true, "Lake Office display", speakPhone = true))
+  }
+
+  @Test
+  public fun `This phone speaking alone needs no Google sign-in and explains its voice`() {
+    assertEquals(
+        "on",
+        Derive.homeSpeakerStatus(
+            true,
+            true,
+            false,
+            true,
+            true,
+            speakHome = false,
+            speakLocal = false,
+            speakPhone = true))
+    assertEquals(
+        Derive.SpeakerHealth.Ok,
+        Derive.homeSpeakerHealth(
+            true, true, false, true, speakHome = false, speakLocal = false, speakPhone = true))
+    assertEquals(
+        "Voice: Android TTS",
+        Derive.phoneVoiceLabel(
+            localEngine = "apple",
+            geminiVoice = "Kore",
+            hasGeminiKey = false,
+            phoneConnected = true,
+            headphonesOnly = false))
+    assertEquals(
+        "Voice: Gemini (Aoede) · headphones only",
+        Derive.phoneVoiceLabel(
+            localEngine = "gemini",
+            geminiVoice = "Aoede",
+            hasGeminiKey = true,
+            phoneConnected = true,
+            headphonesOnly = true))
+    assertEquals(
+        "Voice: Android TTS · link Phone Bridge to receive audio",
+        Derive.phoneVoiceLabel(
+            localEngine = "gemini",
+            geminiVoice = "Aoede",
+            hasGeminiKey = false,
+            phoneConnected = false,
+            headphonesOnly = false))
+  }
+
+  @Test
+  public fun `headphone device types include wired, USB, Bluetooth and BLE headsets but not speaker`() {
+    listOf(3, 4, 7, 8, 22, 23, 26).forEach { type ->
+      assertTrue("type $type should be headphone", Derive.isHeadphoneDeviceType(type))
+    }
+    listOf(1, 2, 15, 18, 24, 27, 30).forEach { type ->
+      assertFalse("type $type should not be headphone", Derive.isHeadphoneDeviceType(type))
+    }
+  }
+
+  @Test
+  public fun `both outputs off is a problem, not an on`() {
+    assertEquals(
+        "no outputs",
+        Derive.homeSpeakerStatus(
+            true, true, true, true, true, speakHome = false, speakLocal = false))
+    assertEquals(
+        Derive.SpeakerHealth.Problem,
+        Derive.homeSpeakerHealth(true, true, true, true, speakHome = false, speakLocal = false))
+    // Switched off overall is still just "off": nothing would be spoken either way.
+    assertEquals(
+        "off",
+        Derive.homeSpeakerStatus(
+            true, true, true, false, true, speakHome = false, speakLocal = false))
+  }
+
+  @Test
+  public fun `the Mac speaking alone needs no Google sign-in`() {
+    assertEquals(
+        "on",
+        Derive.homeSpeakerStatus(
+            true, true, false, true, true, speakHome = false, speakLocal = true))
+    assertEquals(
+        Derive.SpeakerHealth.Ok,
+        Derive.homeSpeakerHealth(true, true, false, true, speakHome = false, speakLocal = true))
+    // ...but the home speakers still do.
+    assertEquals(
+        "not signed in",
+        Derive.homeSpeakerStatus(
+            true, true, false, true, true, speakHome = true, speakLocal = true))
+  }
+
+  @Test
+  public fun `the Mac's voice is named, falling back to its identifier`() {
+    assertEquals("Voice: Aaron", Derive.macVoiceLabel("Aaron", "com.apple.siri.natural.Aaron"))
+    assertEquals(
+        "Voice: com.apple.voice.compact.en-US",
+        Derive.macVoiceLabel("", "com.apple.voice.compact.en-US"))
+    assertEquals(
+        "Voice: Gemini (Puck)",
+        Derive.macVoiceLabel(
+            "Aaron",
+            "com.apple.siri.natural.Aaron",
+            localEngine = "gemini",
+            geminiVoice = "Puck",
+            hasGeminiKey = true))
+    assertEquals(
+        "Voice: Gemini (Kore) · needs API key on Mac",
+        Derive.macVoiceLabel(
+            "Aaron",
+            "com.apple.siri.natural.Aaron",
+            localEngine = "gemini",
+            geminiVoice = "",
+            hasGeminiKey = false))
+  }
+
+  @Test
+  public fun `local engine, Gemini voice, announcement style and style model labels`() {
+    assertEquals(listOf("apple", "gemini"), Derive.localEngines)
+    assertEquals("Apple (on Mac)", Derive.localEngineLabel("apple"))
+    assertEquals("Gemini TTS", Derive.localEngineLabel("gemini"))
+    assertEquals(
+        listOf(
+            "Kore",
+            "Puck",
+            "Aoede",
+            "Charon",
+            "Zephyr",
+            "Fenrir",
+            "Leda",
+            "Orus",
+            "voice_vaoo7ayczx69",
+            "voice_o1be80ujj8bb",
+        ),
+        Derive.geminiVoices)
+    assertEquals(
+        listOf("verbatim", "plain", "briefing", "casual", "custom"), Derive.announcementStyles)
+    assertEquals("Custom", Derive.announcementStyleLabel("custom"))
+    assertEquals("Verbatim", Derive.announcementStyleLabel("verbatim"))
+    assertEquals("Plain spoken", Derive.announcementStyleLabel("plain"))
+    assertEquals("Warm briefing", Derive.announcementStyleLabel("briefing"))
+    assertEquals("Casual", Derive.announcementStyleLabel("casual"))
+    assertEquals("Verbatim", Derive.announcementStyleLabel("unknown"))
+    assertEquals(listOf("apple", "gemini"), Derive.styleModels)
+    assertEquals("Apple (on Mac)", Derive.styleModelLabel("apple"))
+    assertEquals("Gemini Flash", Derive.styleModelLabel("gemini"))
+    assertEquals(listOf("direct_and_mentions", "all"), Derive.beeperAnnounceModes)
+    assertEquals("Direct & mentions", Derive.beeperAnnounceLabel("direct_and_mentions"))
+    assertEquals("All messages", Derive.beeperAnnounceLabel("all"))
+    assertEquals("Direct & mentions", Derive.beeperAnnounceLabel("unknown"))
+  }
+
+  @Test
+  public fun `Courier's networks HomeSpeaker reads itself are read here as well, Beeper's are greyed`() {
+    val slack = AgentBeeperNetwork("slack", "Slack", "skipped")
+    val beeper = Derive.chatNetworkRow("Beeper", slack)
+    assertEquals(Derive.NetworkSwitch.None, beeper.switch)
+    assertEquals("Beeper · Slack", beeper.title)
+
+    val direct = Derive.chatNetworkRow("Courier", slack)
+    assertEquals(Derive.NetworkSwitch.ReadAnyway, direct.switch)
+    assertFalse(direct.on)
+    assertEquals("Courier · Slack", direct.title)
+    assertEquals("read directly", direct.trailing)
+
+    val also =
+        Derive.chatNetworkRow("Courier", AgentBeeperNetwork("slack", "Slack", "reading", true))
+    assertEquals(Derive.NetworkSwitch.ReadAnyway, also.switch)
+    assertTrue(also.on)
+
+    val muted =
+        Derive.chatNetworkRow("Courier", AgentBeeperNetwork("telegram", "Telegram", "muted"))
+    assertEquals(Derive.NetworkSwitch.Mute, muted.switch)
+    assertFalse(muted.on)
+    assertEquals("muted in Courier", muted.subtitle)
+    val reading =
+        Derive.chatNetworkRow("Courier", AgentBeeperNetwork("whatsapp", "WhatsApp", "reading"))
+    assertEquals(Derive.NetworkSwitch.Mute, reading.switch)
+    assertTrue(reading.on)
+  }
+
+  @Test
+  public fun `Courier says where its networks and its token come from`() {
+    assertEquals(
+        "Other networks show here once Courier is being read.",
+        Derive.networksLaterLine("Courier", listed = false))
+    assertEquals(null, Derive.networksLaterLine("Courier", listed = true))
+    assertEquals(null, Derive.networksLaterLine("Beeper", listed = null))
+    assertTrue(Derive.courierTokenSteps.contains("Settings › Integrations › New connection…"))
+    assertTrue(Derive.courierTokenSteps.contains("HomeSpeaker on your Mac"))
+    assertFalse(
+        "off until a token is saved", Derive.courierSwitchEnabled(hasToken = false, on = false))
+    assertTrue("always switchable off", Derive.courierSwitchEnabled(hasToken = false, on = true))
+    assertTrue(Derive.courierSwitchEnabled(hasToken = true, on = false))
+  }
+
+  @Test
+  public fun `speech length labels round trip the wire values and default to summary`() {
+    assertEquals(listOf("headline", "summary", "full"), Derive.speechLengths)
+    assertEquals("Headline", Derive.speechLengthLabel("headline"))
+    assertEquals("Full reply", Derive.speechLengthLabel("FULL"))
+    assertEquals("Summary", Derive.speechLengthLabel("summary"))
+    assertEquals("Summary", Derive.speechLengthLabel(""))
+    assertEquals("Summary", Derive.speechLengthLabel("medium"))
+  }
+
+  @Test
+  public fun `the pause margin stays inside what the Mac accepts`() {
+    assertEquals(2.0, Derive.nextPauseMargin(1.0, 1.0), 1e-9)
+    assertEquals(0.0, Derive.nextPauseMargin(0.0, -1.0), 1e-9)
+    assertEquals(10.0, Derive.nextPauseMargin(10.0, 1.0), 1e-9)
+    assertEquals(10.0, Derive.nextPauseMargin(9.5, 1.0), 1e-9)
+  }
+
+  @Test
+  public fun `the pause margin reads in whole seconds like the Mac's stepper`() {
+    assertEquals("resumes 1 s after the speaker", Derive.pauseMarginLabel(1.0))
+    assertEquals("resumes 3 s after the speaker", Derive.pauseMarginLabel(2.6))
+  }
+
+  @Test
+  public fun `a speaker's volume is never shown as a stale number`() {
+    assertEquals("40%", Derive.speakerVolumeLabel(true, true, false, 40))
+    assertEquals("muted", Derive.speakerVolumeLabel(true, true, true, 40))
+    assertEquals("offline", Derive.speakerVolumeLabel(true, false, false, 40))
+    assertEquals("n/a", Derive.speakerVolumeLabel(false, true, false, 40))
+  }
+
+  @Test
+  public fun `volume steps stay inside 0 to 100`() {
+    assertEquals(50, Derive.nextVolume(40, 10))
+    assertEquals(0, Derive.nextVolume(5, -10))
+    assertEquals(100, Derive.nextVolume(95, 10))
+  }
+
+  // --- battery (API v1.5.1) ----------------------------------------------
+
+  @Test
+  public fun `a missing battery temperature is said, never printed as 0 degrees`() {
+    assertEquals("no battery reading", Derive.batteryTemperatureLabel(null))
+    assertEquals("no battery reading", Derive.batteryTemperatureLabel(Double.NaN))
+    assertEquals("battery 31°", Derive.batteryTemperatureLabel(30.6))
+    // A real zero is still a reading.
+    assertEquals("battery 0°", Derive.batteryTemperatureLabel(0.0))
+  }
+
+  @Test
+  public fun `on AC the adapter draw is the figure, not the battery's zero`() {
+    assertEquals(
+        "31.6 W from adapter · on AC",
+        Derive.batteryPowerLabel(
+            onAc = true, charging = false, drawWatts = 0.0, systemWatts = 31.6))
+    assertEquals(
+        "on AC",
+        Derive.batteryPowerLabel(
+            onAc = true, charging = false, drawWatts = 0.0, systemWatts = null))
+    assertEquals(
+        "40 W from adapter · charging",
+        Derive.batteryPowerLabel(onAc = true, charging = true, drawWatts = 0.0, systemWatts = 40.0))
+    assertEquals(
+        "6.4 W · on battery",
+        Derive.batteryPowerLabel(
+            onAc = false, charging = false, drawWatts = 6.4, systemWatts = 9.0))
+  }
+
+  // --- disk ---------------------------------------------------------------
+
+  @Test
+  public fun `disk turns amber at 80 and red at 95`() {
+    assertEquals(Derive.Fill.Ok, Derive.diskFill(0.0))
+    assertEquals(Derive.Fill.Ok, Derive.diskFill(79.99))
+    assertEquals(Derive.Fill.Warn, Derive.diskFill(80.0))
+    assertEquals(Derive.Fill.Warn, Derive.diskFill(94.9))
+    assertEquals(Derive.Fill.Crit, Derive.diskFill(95.0))
+    assertEquals(Derive.Fill.Crit, Derive.diskFill(100.0))
+    assertEquals(Derive.Fill.Ok, Derive.diskFill(Double.NaN))
+  }
+
+  // --- Claude Code summary ------------------------------------------------
+
+  @Test
+  public fun `sessions and processes keep their own nouns`() {
+    assertEquals("8 sessions · 7 processes", Derive.claudeSummary(8, 0, 7))
+    assertEquals("1 session · 1 process · 1 waiting", Derive.claudeSummary(1, 1, 1))
+    // Not asked yet: absent, not "0 processes".
+    assertEquals("0 sessions", Derive.claudeSummary(0, 0, null))
+  }
+
+  // --- Claude Code permission prompts --------------------------------------
+
+  @Test
+  public fun `the real pending count wins over the transcript guess, even at zero`() {
+    assertEquals(0, Derive.claudeWaitingCount(0, 3))
+    assertEquals(2, Derive.claudeWaitingCount(2, 0))
+    // No list (older agent, unpaired, unreachable): the guess is all there is.
+    assertEquals(3, Derive.claudeWaitingCount(null, 3))
+  }
+
+  @Test
+  public fun `time left counts down in minutes and seconds`() {
+    val now = 1_000_000L
+    assertEquals("1:42", Derive.timeLeft(now + 102_000, now))
+    assertEquals("0:05", Derive.timeLeft(now + 5_000, now))
+    assertEquals("2:00", Derive.timeLeft(now + 120_000, now))
+    // Rounded up: the last answerable second is not "0:00".
+    assertEquals("0:01", Derive.timeLeft(now + 1, now))
+    assertEquals("0:05", Derive.timeLeft(now + 4_001, now))
+  }
+
+  @Test
+  public fun `a prompt past its deadline, or with none, is expired`() {
+    val now = 1_000_000L
+    assertEquals("expired", Derive.timeLeft(now, now))
+    assertEquals("expired", Derive.timeLeft(now - 3_000, now))
+    // Unparseable expires_at arrives as 0: never a made-up countdown.
+    assertEquals("expired", Derive.timeLeft(0, now))
+  }
+
+  @Test
+  public fun `the waiting tag and line say how many`() {
+    assertEquals("1 waiting", Derive.claudeWaitingTag(1))
+    assertEquals("3 waiting", Derive.claudeWaitingTag(3))
+    assertEquals("1 waiting for you", Derive.claudeWaitingLine(1))
+    assertEquals("2 waiting for you", Derive.claudeWaitingLine(2))
+  }
+
+  @Test
+  public fun `a decision logs the tool and project, never the command`() {
+    assertEquals(
+        "claude · allowed Bash in vitruvian-core",
+        Derive.claudeDecisionLog(true, "Bash", "vitruvian-core"))
+    assertEquals("claude · denied Edit in app", Derive.claudeDecisionLog(false, "Edit", "app"))
+    assertEquals("claude · denied WebFetch", Derive.claudeDecisionLog(false, "WebFetch", ""))
+  }
+
+  @Test
+  public fun `the hold time reads in minutes when it is whole minutes`() {
+    assertEquals("2 min", Derive.waitLabel(120))
+    assertEquals("90 s", Derive.waitLabel(90))
+    // Not known yet: the contract's default, not "0 s".
+    assertEquals("2 min", Derive.waitLabel(0))
+  }
+
+  @Test
+  public fun `the hook toggle says what it will change, and how to undo it`() {
+    val off = Derive.claudeHookExplanation(false, "atlas", 120)
+    assertEquals(
+        "Adds a hook to Claude Code on atlas (~/.claude/settings.json, a backup is kept). " +
+            "Prompts then come here first; unanswered for 2 min, they show on the Mac as usual. " +
+            Derive.CLAUDE_HOOK_REACH,
+        off)
+    assertTrue(Derive.claudeHookExplanation(true, "atlas", 120).startsWith("Hook installed."))
+    // Both states say which sessions it applies to: found on the real Mac.
+    assertTrue(
+        Derive.claudeHookExplanation(true, "atlas", 120).contains("started after this is on"))
+    assertTrue(Derive.claudeHookExplanation(false, "", 0).contains("on the Mac ("))
+    val body = Derive.claudeHookDialogBody("atlas", 90)
+    assertTrue(body.contains("~/.claude/settings.json on atlas"))
+    assertTrue(body.contains("every Claude Code session"))
+    assertTrue(body.contains("Unanswered for 90 s"))
+    assertEquals("installing…", Derive.claudeHookBusyLabel(true))
+    assertEquals("removing…", Derive.claudeHookBusyLabel(false))
+  }
+
+  // --- Antigravity parity (API v1.7) ---------------------------------------
+
+  @Test
+  public fun `a session's state becomes its tag and its look`() {
+    assertEquals("waiting", Derive.claudeStateLabel("waiting_for_permission"))
+    assertEquals(Derive.SessionLook.Waiting, Derive.sessionLook("waiting_for_permission"))
+    assertEquals(Derive.SessionLook.Working, Derive.sessionLook("working"))
+    assertEquals(Derive.SessionLook.Idle, Derive.sessionLook("IDLE"))
+    assertEquals("killed", Derive.claudeStateLabel("killed"))
+    assertEquals(Derive.SessionLook.Other, Derive.sessionLook("killed"))
+    assertEquals(Derive.SessionLook.Other, Derive.sessionLook(""))
+    assertEquals(Derive.SessionLook.Other, Derive.sessionLook("compacting"))
+  }
+
+  @Test
+  public fun `Antigravity's summary, and the placeholder that says where Send goes`() {
+    assertEquals("v1.2.11 · 5 models", Derive.antigravitySummary("1.2.11", 5, null))
+    assertEquals("v1.2.11 · 1 model · 1 session", Derive.antigravitySummary("1.2.11", 1, 1))
+    assertEquals("New conversation…", Derive.antigravityPlaceholder(null))
+    assertEquals("New conversation…", Derive.antigravityPlaceholder(" "))
+    assertEquals("Continue \"Fix CI\"…", Derive.antigravityPlaceholder("Fix CI"))
+    assertEquals("2 waiting", Derive.claudeWaitingTag(2))
+    assertEquals("1 waiting for you", Derive.claudeWaitingLine(1))
+  }
+
+  // --- pull request rows --------------------------------------------------
+
+  @Test
+  public fun `a PR title drops the owner`() {
+    assertEquals(
+        "vitruvian-core#2514 · Fix it",
+        Derive.prTitle("VitruvianSoftware/vitruvian-core", 2514, "Fix it"))
+    assertEquals("solo#3 · T", Derive.prTitle("solo", 3, "T"))
+  }
+
+  // --- containers ---------------------------------------------------------
+
+  private data class C(val name: String, val image: String)
+
+  @Test
+  public fun `pause sandboxes are recognised by name or image`() {
+    assertTrue(Derive.isPauseContainer("k8s_POD_coredns-1_kube-system_uid_0", "whatever"))
+    assertTrue(Derive.isPauseContainer("x", "rancher/mirrored-pause:3.6"))
+    assertTrue(Derive.isPauseContainer("x", "registry.k8s.io/pause:3.9"))
+    assertTrue(Derive.isPauseContainer("x", "registry.k8s.io/pause@sha256:abc"))
+    assertFalse(Derive.isPauseContainer("postgres", "postgres:16"))
+    assertFalse(Derive.isPauseContainer("x", "someone/pauseless:1"))
+  }
+
+  @Test
+  public fun `a k8s container name gives its pod`() {
+    assertEquals("coredns-1", Derive.k8sPod("k8s_coredns_coredns-1_kube-system_uid_0"))
+    assertEquals(null, Derive.k8sPod("postgres"))
+    assertEquals(null, Derive.k8sPod("k8s_short"))
+  }
+
+  @Test
+  public fun `pods collapse, pauses go, plain containers stay in order`() {
+    val items =
+        listOf(
+            C("k8s_POD_web-1_default_u_0", "rancher/mirrored-pause:3.6"),
+            C("k8s_app_web-1_default_u_0", "nginx:1"),
+            C("postgres", "postgres:16"),
+            C("k8s_sidecar_web-1_default_u_0", "envoy:1"),
+            C("k8s_coredns_dns-2_kube-system_u_0", "coredns:1"),
+        )
+    val groups = Derive.groupContainers(items, { it.name }, { it.image })
+    assertEquals(
+        listOf("web-1 · 2 containers", "postgres", "dns-2 · 1 container"), groups.map { it.title })
+    assertEquals(listOf(true, false, true), groups.map { it.pod })
+    assertEquals(2, groups[0].members.size)
+    assertEquals(1, Derive.pauseCount(items, { it.name }, { it.image }))
+  }
+
+  // --- HomeSpeaker progressive disclosure ----------------------------------
+
+  @Test
+  public fun `gemini voice display name prefers a cloned voice's name`() {
+    val custom = listOf(AgentCustomVoice("clone-1", "James"), AgentCustomVoice("clone-2", "Ana"))
+    assertEquals("James", Derive.geminiVoiceDisplayName("clone-1", custom))
+    assertEquals("Kore", Derive.geminiVoiceDisplayName("Kore", custom))
+    // A deleted clone still shows something honest: its id.
+    assertEquals("clone-9", Derive.geminiVoiceDisplayName("clone-9", custom))
+    assertEquals("Puck", Derive.geminiVoiceDisplayName("Puck", emptyList()))
+    assertEquals("Freeman", Derive.geminiVoiceDisplayName("voice_vaoo7ayczx69", emptyList()))
+    assertEquals("James", Derive.geminiVoiceDisplayName("voice_o1be80ujj8bb", emptyList()))
+  }
+
+  @Test
+  public fun `home speaker settings hide only when the home output is known off`() {
+    assertTrue(Derive.homeSettingsRelevant(true))
+    assertFalse(Derive.homeSettingsRelevant(false))
+    // An agent too old to switch outputs always speaks on the home speaker.
+    assertTrue(Derive.homeSettingsRelevant(null))
+  }
+
+  @Test
+  public fun `cast selected voice shows only for home speaker with gemini`() {
+    assertTrue(Derive.castVoiceRelevant(true, "gemini"))
+    assertFalse(Derive.castVoiceRelevant(true, "apple"))
+    assertFalse(Derive.castVoiceRelevant(false, "gemini"))
+    assertFalse(Derive.castVoiceRelevant(null, "gemini"))
+  }
+
+  @Test
+  public fun `local voice settings show only when an output speaks with them`() {
+    // When only home speaker is on, local voice engine is visible to avoid deadlock
+    assertTrue(Derive.localVoiceInUse(false, false, true, false))
+    assertFalse(Derive.localVoiceInUse(false, null, false, true))
+    assertTrue(Derive.localVoiceInUse(true, false, false, false))
+    assertTrue(Derive.localVoiceInUse(false, true, false, false))
+    // The home speaker uses the local voice only when it casts it or to configure it.
+    assertTrue(Derive.localVoiceInUse(false, false, true, true))
+    assertFalse(Derive.localVoiceInUse(false, false, null, true))
+  }
+
+  @Test
+  public fun `cast selected voice reachability when only home speaker is enabled`() {
+    // Deadlock reproduction & resolution test:
+    // When only Home speakers is on and localEngine is "apple":
+    val speakHome = true
+    val speakLocal = false
+    val speakPhone = false
+    var localEngine = "apple"
+
+    // 1. Local voice engine control is visible so user is NOT deadlocked:
+    assertTrue(Derive.localVoiceInUse(speakLocal, speakPhone, speakHome, false))
+    // Cast selected voice is hidden initially while localEngine == "apple"
+    assertFalse(Derive.castVoiceRelevant(speakHome, localEngine))
+
+    // 2. User selects "gemini" in Local voice engine:
+    localEngine = "gemini"
+
+    // 3. Cast selected voice is now revealed and reachable!
+    assertTrue(Derive.castVoiceRelevant(speakHome, localEngine))
+  }
+
+  @Test
+  public fun `quiet hours choices preserves off step values`() {
+    assertEquals(48, Derive.quietHoursSlots.size)
+    assertEquals("00:00", Derive.quietHoursSlots.first())
+    assertEquals("23:30", Derive.quietHoursSlots.last())
+
+    val standard = Derive.quietHoursChoices("07:00")
+    assertEquals(48, standard.size)
+
+    val offStep = Derive.quietHoursChoices("07:15")
+    assertEquals(49, offStep.size)
+    assertTrue("07:15" in offStep)
+  }
+
+  @Test
+  public fun `quiet hours subtitle reflects active status`() {
+    assertEquals(
+        "off · plays at any hour", Derive.quietHoursSubtitle(false, false, "22:00", "07:00"))
+    assertEquals(
+        "active until 07:00 · what you type still plays",
+        Derive.quietHoursSubtitle(true, true, "22:00", "07:00"))
+    assertEquals(
+        "quiet from 22:00 to 07:00", Derive.quietHoursSubtitle(true, false, "22:00", "07:00"))
+  }
+
+  @Test
+  public fun `volume and margin choices generation`() {
+    assertEquals(11, Derive.volumePercentChoices.size) // 0..100 step 10
+    assertEquals(10, Derive.announceVolumePercentChoices.size) // 10..100 step 10
+    val offStep = Derive.announceVolumeChoices(45)
+    assertEquals(11, offStep.size)
+    assertTrue(45 in offStep)
+
+    assertEquals(11, Derive.pauseMarginSecondChoices.size) // 0.0..10.0
+    assertEquals("2 min", Derive.pollIntervalLabel(120))
+    assertEquals("15 s", Derive.pollIntervalLabel(15))
+    assertEquals("Google API", Derive.googleChatSourceLabel("api"))
+    assertEquals("Automatic", Derive.googleChatSourceLabel("auto"))
+  }
+
+  @Test
+  public fun `phrasing settings hide only when every coding agent is known off`() {
+    assertTrue(Derive.allCodingAgentsOff(false, false, false))
+    assertFalse(Derive.allCodingAgentsOff(true, false, false))
+    assertFalse(Derive.allCodingAgentsOff(false, false, true))
+    // An older agent without the OpenCode switch is not "all off".
+    assertFalse(Derive.allCodingAgentsOff(false, false, null))
+    assertFalse(Derive.allCodingAgentsOff(null, null, null))
+  }
+
+  @Test
+  public fun `speaker choice label names the room, or says all rooms`() {
+    assertEquals(
+        "Kitchen · Nest Mini", Derive.speakerChoiceLabel("Nest Mini", "Kitchen", "Speaker"))
+    assertEquals("Whole Home (all rooms)", Derive.speakerChoiceLabel("Whole Home", "", "Structure"))
+  }
+
+  @Test
+  public fun `tv status orders missing adb and offline ahead of power state`() {
+    assertEquals(
+        "no adb",
+        Derive.tvStatus(available = false, connected = false, awake = false, dreaming = false))
+    assertEquals(
+        "disconnected",
+        Derive.tvStatus(available = true, connected = false, awake = true, dreaming = false))
+    assertEquals(
+        "dreaming",
+        Derive.tvStatus(available = true, connected = true, awake = false, dreaming = true))
+    assertEquals(
+        "awake",
+        Derive.tvStatus(available = true, connected = true, awake = true, dreaming = false))
+    assertEquals(
+        "standby",
+        Derive.tvStatus(available = true, connected = true, awake = false, dreaming = false))
+  }
+
+  @Test
+  public fun `agent hook status label across all combinations`() {
+    // speaksTwice warning takes highest priority
+    assertEquals(
+        "warning: hook + skill installed (speaks twice)",
+        Derive.agentHookStatusLabel(
+            hookState = "installed", speaksTwice = true, configuredByInstruction = true))
+    assertEquals(
+        "warning: hook + skill installed (speaks twice)",
+        Derive.agentHookStatusLabel(
+            hookState = "stale", speaksTwice = true, configuredByInstruction = false))
+
+    // installed hook
+    assertEquals(
+        "Stop hook installed",
+        Derive.agentHookStatusLabel(
+            hookState = "installed", speaksTwice = false, configuredByInstruction = false))
+    assertEquals(
+        "Stop hook installed",
+        Derive.agentHookStatusLabel(
+            hookState = "installed", speaksTwice = false, configuredByInstruction = true))
+
+    // stale hook
+    assertEquals(
+        "Stop hook outdated",
+        Derive.agentHookStatusLabel(
+            hookState = "stale", speaksTwice = false, configuredByInstruction = false))
+
+    // instruction only
+    assertEquals(
+        "Instruction configured in prompt",
+        Derive.agentHookStatusLabel(
+            hookState = "none", speaksTwice = false, configuredByInstruction = true))
+
+    // none
+    assertEquals(
+        "Not installed",
+        Derive.agentHookStatusLabel(
+            hookState = "none", speaksTwice = false, configuredByInstruction = false))
+    assertEquals(
+        "Not installed",
+        Derive.agentHookStatusLabel(
+            hookState = "", speaksTwice = false, configuredByInstruction = false))
+  }
+
+  // --- demand-driven polling ----------------------------------------------
+
+  private val tick = 1500L
+
+  private fun view(
+      page: PollPage,
+      module: String = "claude",
+      dashboards: Boolean = true,
+      foreground: Boolean = true,
+  ) = PollView(page, module, dashboards, foreground)
+
+  /** Everything fetched at [at], so only cadence decides what is due next. */
+  private fun allFetchedAt(at: Long): Map<PollSource, Long> =
+      PollSource.values().associateWith { at }
+
+  private val chrome = setOf(PollSource.Metrics, PollSource.Host)
+
+  @Test
+  public fun `an idle Home asks only for what Home draws`() {
+    val due = Derive.pollDue(view(PollPage.Home), tick, nowMs = 0, lastFetchedMs = emptyMap())
+    assertEquals(
+        chrome +
+            setOf(
+                PollSource.ClaudeSessions,
+                PollSource.Sessions,
+                PollSource.Prs,
+                PollSource.Antigravity,
+                PollSource.Ollama,
+                PollSource.Vms,
+                PollSource.K8s,
+                PollSource.Argo,
+                PollSource.Containers,
+                PollSource.HomeSpeaker,
+            ),
+        due,
+    )
+    // The ones nothing on Home draws: the TV, the speaker's volume, the Mac
+    // screen's process list and power plates, the Remote's audio.
+    for (hidden in
+        listOf(
+            PollSource.Tv,
+            PollSource.SpeakerVolume,
+            PollSource.Processes,
+            PollSource.Audio,
+            PollSource.Power,
+            PollSource.Tools,
+            PollSource.Notify,
+            PollSource.AntigravitySessions,
+        )) {
+      assertFalse("$hidden is not on Home", hidden in due)
+    }
+  }
+
+  @Test
+  public fun `Home summary rows refresh slower than an open dashboard`() {
+    val home = view(PollPage.Home)
+    val fetched = allFetchedAt(0)
+    // A slow tick later: an open dashboard would ask again; Home's one-line
+    // summary does not, but metrics and the Claude rows still do.
+    val atSlowTick = Derive.pollDue(home, tick, tick * Derive.SLOW_POLL_EVERY, fetched)
+    assertFalse(PollSource.HomeSpeaker in atSlowTick)
+    assertFalse(PollSource.Ollama in atSlowTick)
+    assertTrue(PollSource.Metrics in atSlowTick)
+    assertTrue(PollSource.ClaudeSessions in atSlowTick)
+    assertTrue(PollSource.Sessions in atSlowTick)
+    val atSummary = Derive.pollDue(home, tick, Derive.SUMMARY_POLL_MS, fetched)
+    assertTrue(PollSource.HomeSpeaker in atSummary)
+    assertTrue(PollSource.Argo in atSummary)
+    // GitHub keeps its own minute even on Home.
+    assertFalse(PollSource.Prs in atSummary)
+    assertTrue(PollSource.Prs in Derive.pollDue(home, tick, Derive.PR_POLL_MS, fetched))
+  }
+
+  @Test
+  public fun `the HomeSpeaker module asks for the speaker and nothing else`() {
+    val due =
+        Derive.pollDue(view(PollPage.Apps, "homespeaker"), tick, 0, lastFetchedMs = emptyMap())
+    assertEquals(chrome + setOf(PollSource.HomeSpeaker, PollSource.SpeakerVolume), due)
+  }
+
+  @Test
+  public fun `the TV is asked for only on the TV module`() {
+    for (page in PollPage.values()) {
+      for (module in listOf("claude", "homespeaker", "prs", "homelab", "lima", "docker")) {
+        assertFalse(
+            "tv asked on $page/$module",
+            PollSource.Tv in Derive.pollDue(view(page, module), tick, 0, emptyMap()))
+      }
+    }
+    assertEquals(
+        chrome + PollSource.Tv, Derive.pollDue(view(PollPage.Apps, "tv"), tick, 0, emptyMap()))
+    // The gallery is a different view of Apps: it reads the tool inventory.
+    assertEquals(
+        chrome + PollSource.Tools,
+        Derive.pollDue(view(PollPage.Apps, "tv", dashboards = false), tick, 0, emptyMap()))
+  }
+
+  @Test
+  public fun `each module asks for its own sources`() {
+    fun extras(module: String) =
+        Derive.pollDue(view(PollPage.Apps, module), tick, 0, emptyMap()) - chrome
+    assertEquals(setOf(PollSource.Argo, PollSource.K8s), extras("homelab"))
+    assertEquals(setOf(PollSource.Vms), extras("lima"))
+    assertEquals(setOf(PollSource.Ollama), extras("ollama"))
+    assertEquals(setOf(PollSource.Prs), extras("prs"))
+    assertEquals(setOf(PollSource.Containers), extras("docker"))
+    assertEquals(setOf(PollSource.ClaudeSessions, PollSource.Sessions), extras("claude"))
+    assertEquals(
+        setOf(PollSource.Antigravity, PollSource.AntigravitySessions), extras("antigravity"))
+    // Grafana's query is run when the module opens, not on the tick.
+    assertEquals(emptySet<PollSource>(), extras("grafana"))
+  }
+
+  @Test
+  public fun `other screens ask for what they draw`() {
+    fun extras(page: PollPage) = Derive.pollDue(view(page), tick, 0, emptyMap()) - chrome
+    assertEquals(setOf(PollSource.Audio), extras(PollPage.Remote))
+    assertEquals(
+        setOf(
+            PollSource.Processes,
+            PollSource.Vms,
+            PollSource.Containers,
+            PollSource.K8s,
+            PollSource.Power,
+        ),
+        extras(PollPage.Mac),
+    )
+    assertEquals(setOf(PollSource.Notify), extras(PollPage.Hosts))
+    assertEquals(emptySet<PollSource>(), extras(PollPage.Console))
+  }
+
+  @Test
+  public fun `opening a module fetches at once rather than at the next slow tick`() {
+    // HomeSpeaker was read for Home's row two seconds ago: not due on Home,
+    // and under the old fixed cadence not due for another slow tick either.
+    val last = allFetchedAt(0)
+    val now = 2_000L
+    assertFalse(PollSource.HomeSpeaker in Derive.pollDue(view(PollPage.Home), tick, now, last))
+    // The volume has never been asked for at all, so opening the module asks
+    // for it immediately.
+    val lastNoVolume = last - PollSource.SpeakerVolume
+    val opened = Derive.pollDue(view(PollPage.Apps, "homespeaker"), tick, now, lastNoVolume)
+    assertTrue(PollSource.SpeakerVolume in opened)
+    // And a source that went stale while it was off screen is due the moment
+    // it comes back, whatever the tick count says.
+    val tvLast = mapOf(PollSource.Tv to 0L)
+    assertTrue(PollSource.Tv in Derive.pollDue(view(PollPage.Apps, "tv"), tick, 60_000, tvLast))
+    assertEquals(
+        Derive.MIN_POLL_WAIT_MS,
+        Derive.pollWaitMs(view(PollPage.Apps, "tv"), tick, 60_000, allFetchedAt(60_000) + tvLast))
+  }
+
+  @Test
+  public fun `a module that has just come on screen is refreshed whatever its cadence says`() {
+    // The 30 s refresh setting: the TV's slow cadence is 90 s, and it was read
+    // a minute ago. Without the transition it would sit on that reading for
+    // another half minute after being opened.
+    val slowTick = 30_000L
+    val homeVisible = Derive.pollCadences(view(PollPage.Home), slowTick)
+    val tv = view(PollPage.Apps, "tv")
+    val last = allFetchedAt(0)
+    assertFalse(PollSource.Tv in Derive.pollDue(tv, slowTick, 60_000, last))
+    assertTrue(PollSource.Tv in Derive.pollDue(tv, slowTick, 60_000, last, homeVisible))
+    // Home read HomeSpeaker for its row a moment ago; opening the module
+    // still asks again, and for the volume Home never shows.
+    val speaker = view(PollPage.Apps, "homespeaker")
+    assertEquals(
+        setOf(PollSource.HomeSpeaker, PollSource.SpeakerVolume),
+        Derive.pollDue(speaker, tick, 100, last, Derive.pollCadences(view(PollPage.Home), tick)))
+    // Once it has been on screen for a pass, the cadence takes over again.
+    val speakerVisible = Derive.pollCadences(speaker, tick)
+    assertEquals(emptySet<PollSource>(), Derive.pollDue(speaker, tick, 100, last, speakerVisible))
+    // And coming back to the foreground is a transition too.
+    val awayVisible = Derive.pollCadences(speaker.copy(foreground = false), tick)
+    // Everything on screen is asked for at once, host identity included.
+    assertEquals(
+        chrome + setOf(PollSource.HomeSpeaker, PollSource.SpeakerVolume),
+        Derive.pollDue(speaker, tick, 100, last, awayVisible))
+  }
+
+  @Test
+  public fun `a visible module keeps its cadence`() {
+    val tv = view(PollPage.Apps, "tv")
+    val last = allFetchedAt(0)
+    val slow = tick * Derive.SLOW_POLL_EVERY
+    assertFalse(PollSource.Tv in Derive.pollDue(tv, tick, slow - 1, last))
+    assertTrue(PollSource.Tv in Derive.pollDue(tv, tick, slow, last))
+    // Metrics keep the tick.
+    assertTrue(PollSource.Metrics in Derive.pollDue(tv, tick, tick, last))
+  }
+
+  @Test
+  public fun `backgrounded, the app asks only whether the Mac still answers`() {
+    val away = view(PollPage.Apps, "homespeaker", foreground = false)
+    val last = allFetchedAt(0)
+    // Nothing for a long while after the last read...
+    assertEquals(
+        emptySet<PollSource>(), Derive.pollDue(away, tick, Derive.BACKGROUND_POLL_MS - 1, last))
+    // ...and then the reachability check alone: no speaker, no sessions, no
+    // PRs, however stale they are.
+    assertEquals(
+        setOf(PollSource.Metrics), Derive.pollDue(away, tick, 10 * Derive.PR_POLL_MS, last))
+    // Host identity only if it was never read (Wake-on-LAN needs the MAC).
+    assertEquals(chrome, Derive.pollDue(away, tick, 0, emptyMap()))
+    // Coming back is an immediate refresh of what is on screen.
+    val back = away.copy(foreground = true)
+    assertEquals(
+        setOf(PollSource.Metrics, PollSource.HomeSpeaker, PollSource.SpeakerVolume),
+        Derive.pollDue(back, tick, Derive.BACKGROUND_POLL_MS, last))
+  }
+
+  @Test
+  public fun `an old agent is asked for Antigravity sessions only on the slow tick`() {
+    val legacy = view(PollPage.Apps, "antigravity").copy(antigravitySessionsSupported = false)
+    val last = allFetchedAt(0)
+    assertFalse(PollSource.AntigravitySessions in Derive.pollDue(legacy, tick, tick, last))
+    assertTrue(
+        PollSource.AntigravitySessions in
+            Derive.pollDue(legacy, tick, tick * Derive.SLOW_POLL_EVERY, last))
+    val current = view(PollPage.Apps, "antigravity")
+    assertTrue(PollSource.AntigravitySessions in Derive.pollDue(current, tick, tick, last))
+  }
+
+  @Test
+  public fun `the loop sleeps until the next due source, within bounds`() {
+    val home = view(PollPage.Home)
+    // Everything just fetched: the next thing due is metrics, one tick out.
+    assertEquals(tick, Derive.pollWaitMs(home, tick, 0, allFetchedAt(0)))
+    assertEquals(500L, Derive.pollWaitMs(home, tick, 1_000, allFetchedAt(0)))
+    // Something due now still sleeps the floor, so an unreachable Mac cannot spin the loop.
+    assertEquals(Derive.MIN_POLL_WAIT_MS, Derive.pollWaitMs(home, tick, 0, emptyMap()))
+    // Backgrounded, still ticks (pairing and the trust timer ride the loop).
+    val away = home.copy(foreground = false)
+    assertEquals(tick, Derive.pollWaitMs(away, tick, 0, allFetchedAt(0)))
+  }
+
+  /**
+   * The point of all this, counted: a minute on an idle Home screen against the old loop, which
+   * asked for every endpoint on a fixed cadence whatever was on screen.
+   */
+  @Test
+  public fun `an idle minute on Home costs a fraction of the old fixed cadence`() {
+    val minute = 60_000L
+    val ticks = (minute / tick).toInt()
+    // The old loop, per tick: metrics, processes, audio, Claude sessions,
+    // Antigravity sessions; every third tick twelve more plus two PromQL
+    // queries; PRs once a minute; host every 40.
+    val old = ticks * 5 + (ticks + 2) / 3 * 14 + 1 + 1 + ticks / 40
+    fun simulate(v: PollView): Map<PollSource, Int> {
+      val last = HashMap<PollSource, Long>()
+      val counts = HashMap<PollSource, Int>()
+      var now = 0L
+      while (now < minute) {
+        for (s in Derive.pollDue(v, tick, now, last)) {
+          last[s] = now
+          counts[s] = (counts[s] ?: 0) + 1
+        }
+        now += Derive.pollWaitMs(v, tick, now, last)
+      }
+      return counts
+    }
+    val home = simulate(view(PollPage.Home))
+    val homeTotal = home.values.sum()
+    assertTrue("idle Home made $homeTotal requests vs $old", homeTotal * 2 < old)
+    assertEquals(null, home[PollSource.Tv])
+    assertEquals(null, home[PollSource.SpeakerVolume])
+    // HomeSpeaker's row: once on arrival, then every SUMMARY_POLL_MS.
+    assertEquals((minute / Derive.SUMMARY_POLL_MS).toInt(), home[PollSource.HomeSpeaker])
+    val speaker = simulate(view(PollPage.Apps, "homespeaker"))
+    assertEquals(
+        setOf(
+            PollSource.Metrics, PollSource.Host, PollSource.HomeSpeaker, PollSource.SpeakerVolume),
+        speaker.keys)
+    val away = simulate(view(PollPage.Home, foreground = false))
+    assertEquals(mapOf(PollSource.Metrics to 2, PollSource.Host to 1), away)
+  }
+}

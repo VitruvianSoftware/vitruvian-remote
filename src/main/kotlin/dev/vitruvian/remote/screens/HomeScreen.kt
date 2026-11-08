@@ -1,0 +1,271 @@
+// Copyright (c) 2026 VitruvianSoftware
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+package dev.vitruvian.remote.screens
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import dev.vitruvian.design.AutoGrid
+import dev.vitruvian.design.ButtonVariant
+import dev.vitruvian.design.Label
+import dev.vitruvian.design.ListItem
+import dev.vitruvian.design.LogStream
+import dev.vitruvian.design.Meter
+import dev.vitruvian.design.Metric
+import dev.vitruvian.design.Plate
+import dev.vitruvian.design.Space
+import dev.vitruvian.design.Tag
+import dev.vitruvian.design.VButton
+import dev.vitruvian.design.VText
+import dev.vitruvian.design.Vitruvian
+import dev.vitruvian.design.VitruvianType
+import dev.vitruvian.remote.shell.LocalShowDock
+import dev.vitruvian.remote.state.MetricsSource
+import dev.vitruvian.remote.state.RemoteState
+import dev.vitruvian.remote.state.Screen
+import dev.vitruvian.remote.state.Widget
+
+/** `minmax(150dp, 1fr)` - the widget board. */
+private val WIDGET_MIN = 150.dp
+
+/**
+ * `minmax(160dp, 1fr)` - the quick-action board.
+ *
+ * Two to a row on a folded phone. At 110 dp it fitted three, each about 120 dp, and a button label
+ * is one uppercase line: "DEPLOY STAGING" and "SCREENSHOT → CLIP" were cut to "DEPLOY STAGI…".
+ * Wider screens still get as many columns as fit.
+ */
+private val ACTION_MIN = 160.dp
+
+private const val RECENT_ROWS = 4
+private val ADD_WIDGET_HEIGHT = 96.dp
+private val CLOSE_BUTTON = 32.dp
+
+/**
+ * Home: the composable board.
+ *
+ * Widgets, what is running, the macros, and the tail of the event stream - the screen you land on
+ * and the one edit mode reshapes.
+ */
+@Composable
+public fun ColumnScope.HomeScreen(state: RemoteState) {
+  val colors = Vitruvian
+  Row(
+      modifier =
+          Modifier.fillMaxWidth()
+              .padding(start = Space.s4, end = Space.s4, top = Space.s5, bottom = Space.s3),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(Space.s4),
+  ) {
+    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Space.s1)) {
+      Row(
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(Space.s3),
+      ) {
+        Label(state.hostShortName)
+        // Measuring or pretending. A dashboard that cannot say which is
+        // worse than either, so this is never hidden.
+        Tag(text = state.metricsSource.label, tone = state.metricsTagTone)
+      }
+      VText(
+          text = state.hostSubline,
+          style = VitruvianType.listSub,
+          color = colors.textDim,
+      )
+    }
+    VButton(
+        label = if (state.editMode) "Done" else "Edit layout",
+        onClick = state::toggleEditMode,
+    )
+  }
+
+  // Before there is a Mac, the first thing on the board says how to get
+  // one. It disappears the moment an agent URL is set -- a setup card that
+  // outstays its welcome is the thing every dashboard gets wrong.
+  if (state.metricsSource == MetricsSource.Simulated) {
+    Box(modifier = Modifier.padding(horizontal = Space.s4, vertical = Space.s2)) {
+      Plate(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(Space.s4),
+            verticalArrangement = Arrangement.spacedBy(Space.s3),
+        ) {
+          Label("Connect your Mac")
+          VText(
+              text = "Run the agent on the Mac, then enter its Tailscale address.",
+              style = VitruvianType.body.copy(fontSize = VitruvianType.mono.fontSize),
+              color = colors.textDim,
+          )
+          VButton(
+              label = "Set up",
+              onClick = { state.go(Screen.Hosts) },
+              variant = ButtonVariant.Primary,
+          )
+        }
+      }
+    }
+  }
+
+  Box(modifier = Modifier.padding(horizontal = Space.s4)) {
+    AutoGrid(minItemWidth = WIDGET_MIN) {
+      state.widgets.forEach { widget -> item { WidgetPlate(state = state, widget = widget) } }
+      if (state.editMode) {
+        item {
+          Plate(
+              modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = ADD_WIDGET_HEIGHT),
+              dashed = true,
+          ) {
+            VButton(
+                label = "+ Add widget",
+                onClick = state::restoreWidgets,
+                modifier = Modifier.fillMaxWidth().align(Alignment.Center),
+                borderColor = Color.Transparent,
+                contentColor = colors.textDim,
+            )
+          }
+        }
+      }
+    }
+  }
+
+  Label(
+      text = "Running now",
+      modifier =
+          Modifier.padding(start = Space.s4, end = Space.s4, top = Space.s5, bottom = Space.s3),
+  )
+  state.runningNow.forEach { item ->
+    ListItem(
+        title = item.title,
+        subtitle = item.subtitle,
+        status = item.tone,
+        // Opens that module's dashboard on Apps; the chevron says the row
+        // goes somewhere, which a status row otherwise gives no hint of.
+        onClick = { state.openModule(item.moduleId) },
+    ) {
+      Tag(text = item.tag, tone = item.tagTone)
+      VText(text = "›", style = VitruvianType.listTitle, color = colors.textDim)
+    }
+  }
+
+  // When the dock is beside the content it already lists every macro; the
+  // same buttons a second time under the dashboard read as a layout bug.
+  if (!LocalShowDock.current) {
+    Label(
+        text = "Quick actions",
+        modifier =
+            Modifier.padding(start = Space.s4, end = Space.s4, top = Space.s5, bottom = Space.s3),
+    )
+    Box(modifier = Modifier.padding(horizontal = Space.s4)) {
+      AutoGrid(minItemWidth = ACTION_MIN) {
+        state.macros.forEach { macro ->
+          item {
+            VButton(
+                label = macro.label,
+                onClick = { state.runMacro(macro) },
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding =
+                    PaddingValues(
+                        horizontal = Space.s3,
+                    ),
+            )
+          }
+        }
+        item {
+          VButton(
+              label = "+ Macro",
+              onClick = state::openMacroEditor,
+              modifier = Modifier.fillMaxWidth(),
+              dashed = true,
+              contentColor = colors.textDim,
+          )
+        }
+      }
+    }
+  }
+
+  // The dock beside the content already shows the event stream.
+  if (!LocalShowDock.current) {
+    Label(
+        text = "Recent",
+        modifier =
+            Modifier.padding(start = Space.s4, end = Space.s4, top = Space.s5, bottom = Space.s3),
+    )
+    LogStream(
+        entries = state.logs.take(RECENT_ROWS),
+        modifier = Modifier.padding(horizontal = Space.s4),
+    )
+  }
+}
+
+/**
+ * One widget: a metric over a meter, inside a plate.
+ *
+ * In edit mode it grows a close button pinned to its top-right corner, overlapping the plate's own
+ * border by a pixel exactly as the CSS does.
+ */
+@Composable
+private fun WidgetPlate(state: RemoteState, widget: Widget) {
+  val colors = Vitruvian
+  Plate(modifier = Modifier.fillMaxWidth()) {
+    Column(
+        modifier = Modifier.padding(Space.s4),
+        verticalArrangement = Arrangement.spacedBy(Space.s3),
+    ) {
+      Metric(
+          label = widget.label,
+          value = widget.value,
+          delta = widget.sub,
+          valueColor = if (widget.warn) colors.warn else colors.text,
+      )
+      // "ok" has no percentage; a meter under it drew an empty bar that
+      // read as a broken gauge. Only numbers get a bar.
+      if (widget.value.any { it.isDigit() })
+          Meter(
+              fraction = widget.percent / 100f,
+              fillColor = if (widget.warn) colors.warn else colors.accent,
+          )
+      else Box(modifier = Modifier.height(METER_SLOT))
+    }
+    if (state.editMode) {
+      VButton(
+          label = "×",
+          onClick = { state.hideWidget(widget.id) },
+          modifier = Modifier.align(Alignment.TopEnd).size(CLOSE_BUTTON),
+          contentPadding = PaddingValues(0.dp),
+      )
+    }
+  }
+}
+
+/** Reserved where a widget has no bar, so a row of tiles keeps one baseline. */
+private val METER_SLOT = 8.dp

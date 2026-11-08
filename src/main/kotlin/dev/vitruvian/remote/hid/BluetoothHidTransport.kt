@@ -1,0 +1,429 @@
+// Copyright (c) 2026 VitruvianSoftware
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+package dev.vitruvian.remote.hid
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothClass
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHidDevice
+import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import androidx.core.content.ContextCompat
+import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+private const val TAG = "VitruvianHid"
+
+/**
+ * What the app can tell the user about the Bluetooth link, without leaking Android types upward.
+ */
+public enum class HidLinkState {
+  /** No permission, no Bluetooth, or the platform is too old. Nothing will work. */
+  Unavailable,
+
+  /** Registered as a HID device, waiting for a Mac to connect to us. */
+  WaitingForHost,
+
+  /** A host is connected; [BluetoothHidTransport.send] will actually do something. */
+  Connected,
+}
+
+/**
+ * Presents the phone to macOS as a Bluetooth keyboard, so the remote can drive a Mac with **no
+ * software installed on the Mac at all**.
+ *
+ * This is the ESP32's trick ported to Android: `iot/esp32-s3` already pairs to a Mac as an ordinary
+ * BLE keyboard and sends the same reports. [HidCodes] is that firmware's report map and key codes;
+ * this class is only the platform glue around them.
+ *
+ * ## What it does and does not replace
+ *
+ * It covers the CONTROL half of the app -- media, volume, spaces, mission control. It does nothing
+ * for the dashboards: CPU, memory, thermals, Lima, Docker and K3s all still need the Mac agent,
+ * because a keyboard can press keys and cannot report numbers. Treating this as "the app is
+ * finished" would be wrong.
+ *
+ * ## Pairing
+ *
+ * The Mac pairs with the phone through the SYSTEM Bluetooth settings, as it would with any
+ * keyboard. That is not the six-digit code the Hosts screen currently draws -- that flow belongs to
+ * the agent, and the two need reconciling before this is user-facing.
+ */
+public class BluetoothHidTransport(
+    private val context: Context,
+    /**
+     * Told whenever the link changes.
+     *
+     * The UI needs this: an unconnected trackpad and a connected one look identical, so a swipe
+     * that does nothing gives the user no way to tell whether it is Bluetooth, the app, or them.
+     */
+    private val onLinkStateChange: (HidLinkState) -> Unit = {},
+) : HidSender {
+
+  private val scope = CoroutineScope(Dispatchers.Default)
+  private val executor = Executors.newSingleThreadExecutor()
+
+  private var proxy: BluetoothHidDevice? = null
+  private var host: BluetoothDevice? = null
+  private var adapter: BluetoothAdapter? = null
+
+  /**
+   * Guards against registering twice.
+   *
+   * start() is called from onStart AND from the permission callback, and each call asks for a fresh
+   * profile proxy. The second registerApp then fails with "another app is registered" and takes the
+   * FIRST registration down with it, leaving the remote connected to nothing. Cheap to prevent,
+   * confusing to debug: the log shows registered=true immediately followed by registered=false.
+   */
+  private var starting = false
+
+  /**
+   * Whether the app wants the link up: true between start() and stop().
+   *
+   * The retries below only run while this is true, so a remote in the background never keeps
+   * knocking on the Mac.
+   */
+  private var wanted = false
+
+  /** The pending retry, if any. One at a time; a new failure replaces it. */
+  private var retryJob: Job? = null
+
+  /** How many retries in a row have failed, for the backoff. Reset on connect. */
+  private var attempts = 0
+
+  /** Observable enough for the UI without exposing Bluetooth types to it. */
+  public var state: HidLinkState = HidLinkState.Unavailable
+    private set(value) {
+      field = value
+      onLinkStateChange(value)
+    }
+
+  private val sdp =
+      BluetoothHidDeviceAppSdpSettings(
+          "Vitruvian Remote",
+          "Foldable-first Mac remote",
+          "VitruvianSoftware",
+          // Matches the ESP32's advertised appearance: macOS decides how to
+          // treat the device from this, and COMBO/other gets handled less
+          // predictably than a plain keyboard.
+          BluetoothHidDevice.SUBCLASS1_KEYBOARD,
+          HidCodes.REPORT_MAP,
+      )
+
+  private val callback =
+      object : BluetoothHidDevice.Callback() {
+        override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+          Log.i(TAG, "app status: registered=$registered")
+          state = if (registered) HidLinkState.WaitingForHost else HidLinkState.Unavailable
+          // Registering only makes us CONNECTABLE. macOS will not open a
+          // keyboard link on its own just because a bond exists -- a Mac can
+          // sit paired-but-not-connected indefinitely -- so we make the first
+          // move.
+          if (registered) {
+            connectToPairedComputer()
+          } else if (wanted) {
+            // Seen on the Fold: coming back to the app re-registers before the
+            // platform has finished unregistering the last session, the second
+            // registerApp is refused, and nothing ever tried again. Every
+            // Remote button then did nothing until the app was force-stopped.
+            retry("register") { proxy?.let { registerApp(it) } }
+          }
+        }
+
+        override fun onConnectionStateChanged(device: BluetoothDevice?, connectionState: Int) {
+          Log.i(TAG, "connection state: $connectionState")
+          when (connectionState) {
+            BluetoothProfile.STATE_CONNECTED -> {
+              host = device
+              attempts = 0
+              retryJob?.cancel()
+              state = HidLinkState.Connected
+            }
+            BluetoothProfile.STATE_DISCONNECTED -> {
+              host = null
+              state = HidLinkState.WaitingForHost
+              // The Mac slept, walked out of range, or refused this attempt.
+              // It will not dial back on its own, so keep asking while the
+              // remote is on screen.
+              if (wanted) retry("connect") { connectToPairedComputer() }
+            }
+          }
+        }
+      }
+
+  private val serviceListener =
+      object : BluetoothProfile.ServiceListener {
+        @SuppressLint("MissingPermission")
+        override fun onServiceConnected(profile: Int, service: BluetoothProfile?) {
+          if (profile != BluetoothProfile.HID_DEVICE) return
+          starting = false
+          val hid = service as? BluetoothHidDevice ?: return
+          proxy = hid
+          if (!hasConnectPermission()) {
+            Log.w(TAG, "BLUETOOTH_CONNECT not granted; not registering")
+            return
+          }
+          registerApp(hid)
+        }
+
+        override fun onServiceDisconnected(profile: Int) {
+          if (profile != BluetoothProfile.HID_DEVICE) return
+          starting = false
+          proxy = null
+          host = null
+          state = HidLinkState.Unavailable
+        }
+      }
+
+  /**
+   * Starts advertising as a keyboard. Safe to call when Bluetooth is off or the permission is
+   * missing -- it simply stays [HidLinkState.Unavailable].
+   */
+  public fun start() {
+    wanted = true
+    if (starting || proxy != null) return
+    // BluetoothHidDevice is API 28+. The app's minSdk is 26, so this is a real
+    // check rather than a formality: on 26/27 the whole class is absent.
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+      Log.i(TAG, "HID device profile needs API 28; this device is ${Build.VERSION.SDK_INT}")
+      return
+    }
+    val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
+    val adapter: BluetoothAdapter = manager.adapter ?: return
+    if (!adapter.isEnabled) {
+      Log.i(TAG, "Bluetooth is off")
+      return
+    }
+    this.adapter = adapter
+    starting = true
+    adapter.getProfileProxy(context, serviceListener, BluetoothProfile.HID_DEVICE)
+  }
+
+  /**
+   * Asks every paired COMPUTER to accept us as a keyboard.
+   *
+   * Pairing and connecting are different things: the Mac can be bonded to the phone for years and
+   * still have no HID link open. Waiting for the host is therefore a dead end in practice, and this
+   * is the call that actually gets a keyboard talking.
+   *
+   * Filtered to [BluetoothClass.Device.Major.COMPUTER] rather than trying every bond, because
+   * offering a keyboard connection to a pair of earbuds is noise. Returns true if at least one
+   * request was accepted for delivery -- not that a host answered, which arrives later on
+   * [BluetoothHidDevice.Callback.onConnectionStateChanged].
+   */
+  @SuppressLint("MissingPermission")
+  public fun connectToPairedComputer(): Boolean {
+    val hid = proxy ?: return false
+    val adapter = this.adapter ?: return false
+    if (!hasConnectPermission()) return false
+
+    val computers =
+        adapter.bondedDevices.orEmpty().filter {
+          it.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
+        }
+    if (computers.isEmpty()) {
+      Log.i(TAG, "no paired computer to connect to; pair the Mac first")
+      return false
+    }
+    var requested = false
+    for (device in computers) {
+      val ok = runCatching { hid.connect(device) }.getOrDefault(false)
+      Log.i(TAG, "connect request -> accepted=$ok")
+      requested = requested || ok
+    }
+    return requested
+  }
+
+  /** Stops advertising and releases the proxy. */
+  @SuppressLint("MissingPermission")
+  public fun stop() {
+    wanted = false
+    retryJob?.cancel()
+    retryJob = null
+    attempts = 0
+    starting = false
+    val hid = proxy ?: return
+    if (hasConnectPermission()) {
+      runCatching { hid.unregisterApp() }
+    }
+    // Close the proxy too. Without this every trip to the background leaked
+    // one, and the next start() raced a registration the platform still held.
+    runCatching { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hid) }
+    proxy = null
+    host = null
+    state = HidLinkState.Unavailable
+  }
+
+  /**
+   * Gets the link back after a failed press: registers, or dials the Mac, whichever is missing.
+   *
+   * Called by the UI when a send returns false, so the user's own tap is the retry -- no need to
+   * leave the app and come back, which is what it used to take.
+   */
+  override fun reconnect() {
+    if (!wanted) return
+    val hid = proxy
+    when {
+      hid == null -> start()
+      state == HidLinkState.Unavailable -> registerApp(hid)
+      state == HidLinkState.WaitingForHost -> connectToPairedComputer()
+      else -> Unit
+    }
+  }
+
+  @SuppressLint("MissingPermission")
+  private fun registerApp(hid: BluetoothHidDevice) {
+    if (!hasConnectPermission()) {
+      Log.w(TAG, "BLUETOOTH_CONNECT not granted; not registering")
+      return
+    }
+    val ok =
+        runCatching { hid.registerApp(sdp, null, null, executor, callback) }.getOrDefault(false)
+    Log.i(TAG, "register request -> accepted=$ok")
+    if (!ok && wanted) retry("register") { proxy?.let { registerApp(it) } }
+  }
+
+  /**
+   * Runs [block] after a backoff of 1, 2, 4, 8, 15 then 30 seconds, while the remote is on screen.
+   */
+  private fun retry(what: String, block: () -> Unit) {
+    retryJob?.cancel()
+    val wait = RETRY_BACKOFF_MS[attempts.coerceAtMost(RETRY_BACKOFF_MS.lastIndex)]
+    attempts++
+    Log.i(TAG, "retrying $what in ${wait}ms (attempt $attempts)")
+    retryJob =
+        scope.launch {
+          delay(wait)
+          if (wanted && state != HidLinkState.Connected) block()
+        }
+  }
+
+  private companion object {
+    val RETRY_BACKOFF_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 15_000, 30_000)
+  }
+
+  /**
+   * Sends one action, press then release.
+   *
+   * The release is not optional and not merely tidy: without it a modifier stays latched on the Mac
+   * and every subsequent keystroke the USER types is modified. The dwell between them is
+   * [HidCodes.KEY_DWELL_MS] because macOS drops a press/release pair delivered in the same
+   * event-loop turn -- with no dwell the button appears to do nothing.
+   *
+   * Returns false when there is no connected host, so callers can fall back rather than pretend the
+   * Mac received something.
+   */
+  @SuppressLint("MissingPermission")
+  override fun send(action: HidAction): Boolean {
+    val hid = proxy ?: return false
+    val target = host ?: return false
+    if (!hasConnectPermission()) return false
+
+    val (id, press, release) =
+        when (action) {
+          is HidAction.Key ->
+              Triple(
+                  HidCodes.KEYBOARD_REPORT_ID,
+                  HidCodes.keyboardReport(action.modifiers, action.usage),
+                  HidCodes.keyboardRelease(),
+              )
+          is HidAction.Consumer ->
+              Triple(
+                  HidCodes.CONSUMER_REPORT_ID,
+                  HidCodes.consumerReport(action.usage),
+                  HidCodes.consumerRelease(),
+              )
+        }
+
+    if (!hid.sendReport(target, id, press)) {
+      Log.w(TAG, "sendReport(press) refused for $action")
+      return false
+    }
+    // Released off the caller's thread so a tap never blocks the UI for the
+    // dwell. Failure to release is logged rather than swallowed: a stuck
+    // modifier is the worst outcome this class can produce.
+    scope.launch {
+      delay(HidCodes.KEY_DWELL_MS)
+      if (!hid.sendReport(target, id, release)) {
+        Log.e(TAG, "sendReport(release) refused for $action -- a key may be stuck on the host")
+      }
+    }
+    return true
+  }
+
+  /**
+   * Sends one mouse report. No auto-release: the caller decides when a button comes up, because a
+   * drag holds it down across many reports.
+   */
+  @SuppressLint("MissingPermission")
+  override fun sendPointer(dx: Int, dy: Int, buttons: Int, wheel: Int): Boolean {
+    val hid = proxy ?: return false
+    val target = host ?: return false
+    if (!hasConnectPermission()) return false
+    return hid.sendReport(
+        target, HidCodes.MOUSE_REPORT_ID, HidCodes.mouseReport(buttons, dx, dy, wheel))
+  }
+
+  @SuppressLint("MissingPermission")
+  override fun sendSequence(keys: List<HidAction.Key>): Boolean {
+    val hid = proxy ?: return false
+    val target = host ?: return false
+    if (!hasConnectPermission()) return false
+    if (keys.isEmpty()) return true
+
+    scope.launch {
+      for (key in keys) {
+        val press = HidCodes.keyboardReport(key.modifiers, key.usage)
+        if (!hid.sendReport(target, HidCodes.KEYBOARD_REPORT_ID, press)) {
+          Log.w(TAG, "sendReport(press) refused mid-sequence; stopping")
+          // Always lift, even on failure: a half-sent sequence must not leave
+          // a modifier latched on the host.
+          hid.sendReport(target, HidCodes.KEYBOARD_REPORT_ID, HidCodes.keyboardRelease())
+          return@launch
+        }
+        delay(HidCodes.KEY_DWELL_MS)
+        // The release is what separates one keystroke from the next. Without
+        // it two identical characters in a row look like one held key.
+        hid.sendReport(target, HidCodes.KEYBOARD_REPORT_ID, HidCodes.keyboardRelease())
+        delay(HidCodes.KEY_DWELL_MS)
+      }
+    }
+    return true
+  }
+
+  private fun hasConnectPermission(): Boolean =
+      // BLUETOOTH_CONNECT only exists from API 31; below that the legacy
+      // install-time BLUETOOTH permission covers it.
+      Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+          ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+              PackageManager.PERMISSION_GRANTED
+}

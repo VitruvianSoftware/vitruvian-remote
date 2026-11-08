@@ -1,0 +1,7150 @@
+// Copyright (c) 2026 VitruvianSoftware
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+package dev.vitruvian.remote.state
+
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.runtime.toMutableStateList
+import dev.vitruvian.design.LogEntry
+import dev.vitruvian.design.SegState
+import dev.vitruvian.design.StatusTone
+import dev.vitruvian.design.TagTone
+import dev.vitruvian.design.TerminalLine
+import dev.vitruvian.design.TerminalTone
+import dev.vitruvian.remote.hid.HidAction
+import dev.vitruvian.remote.hid.HidCodes
+import dev.vitruvian.remote.hid.HidLinkState
+import dev.vitruvian.remote.hid.HidSender
+import dev.vitruvian.remote.trackpad.TrackpadTuning
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.random.Random
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** How often the live metric series advances. */
+private const val TICK_MS = 1500L
+
+/** The window of samples the sparks show - 30 samples at 1.5 s is the "60 s" caption. */
+public const val SERIES_LENGTH: Int = 30
+
+private const val LOG_LIMIT = 40
+private const val TERMINAL_LIMIT = 60
+
+/** Fixed values the prototype states as constants rather than deriving. */
+public const val MEMORY_PERCENT: Int = 41
+public const val BATTERY_PERCENT: Int = 87
+public const val DISK_PERCENT: Int = 60
+public const val TRACK_PERCENT: Int = 66
+
+/** Thermals above this read as warn, on both the widget and the Mac screen. */
+public const val THERMAL_WARN_C: Int = 75
+
+/**
+ * Everything the app knows.
+ *
+ * A single observable holder rather than a per-screen ViewModel: the screens of this app are views
+ * onto one host, and the dock shows two of them at once, so splitting the state would mean plumbing
+ * most of it back together.
+ */
+@Stable
+public class RemoteState(
+    private val persistence: Persistence,
+    initialConnection: Connection = Connection.Connected,
+    private val random: Random = Random.Default,
+    /**
+     * Sends real key presses to a Mac over Bluetooth HID.
+     *
+     * Null in previews and tests, and null on a device with no host connected -- every call site
+     * below treats "not sent" as ordinary, because until the Mac agent exists the mock IS the
+     * product for everything this cannot carry.
+     */
+    private val hid: HidSender? = null,
+    /**
+     * The phone's clipboard, as a port rather than a `ClipboardManager`.
+     *
+     * Named for the device it belongs to because [clipboard] below is the Mac's. Null in previews
+     * and tests; the push and pull buttons then say so rather than pretending.
+     */
+    private val phoneClipboard: PhoneClipboard? = null,
+    /**
+     * The phone's own notification shade, as a port for the same reason as [phoneClipboard]: this
+     * class has no `Context` and must not acquire one.
+     *
+     * Null in previews and tests, and then nothing is posted -- which is correct, because a
+     * notification is a claim that something happened while nobody was looking, and a test is
+     * always looking.
+     */
+    private val notifier: Notifier? = null,
+    /**
+     * The phone bridge -- the foreground service, the trust window and the permission dialogs.
+     *
+     * A port for the same reason as [notifier]: all three of those need a `Context` and this class
+     * has none. Null in previews and tests, and the Hosts plate then says the bridge is unavailable
+     * instead of drawing a switch that cannot start anything.
+     */
+    private val bridge: BridgeControl? = null,
+    /**
+     * Where fire-and-forget actions run.
+     *
+     * Everything that reaches the Mac over HTTP is a round trip, and none of it may block the frame
+     * that dispatched it. A `SupervisorJob` so one failed exec does not cancel the next; the state
+     * lives as long as the process, so there is nothing to cancel it from.
+     */
+    private val scope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+) {
+  // --- navigation -------------------------------------------------------
+  public var screen: Screen by mutableStateOf(Screen.Home)
+    private set
+
+  public var dockOpen: Boolean by mutableStateOf(persistence.dockOpen)
+    private set
+
+  // --- host -------------------------------------------------------------
+  public var connection: Connection by mutableStateOf(initialConnection)
+    private set
+
+  /**
+   * Every Mac this phone knows, and which one it is talking to.
+   *
+   * A list rather than one host because the token is per-Mac: switching by retyping a URL would
+   * throw away the pairing every time, which made a second Mac cost more than it was worth.
+   */
+  public var hosts: List<AgentHostEntry> by mutableStateOf(persistence.hosts)
+    private set
+
+  public var selectedHostId: String by
+      mutableStateOf(
+          persistence.selectedHostId.ifBlank { persistence.hosts.firstOrNull()?.id.orEmpty() })
+    private set
+
+  /** The Mac every call below goes to. Null means there is none and the app is simulating. */
+  public val selectedHost: AgentHostEntry?
+    get() = hosts.firstOrNull { it.id == selectedHostId } ?: hosts.firstOrNull()
+
+  /**
+   * A real six-digit code, generated here and offered to the Mac.
+   *
+   * The phone is the one that invents it: the Mac's `pair` subcommand takes it as an argument, so
+   * there is nothing to fetch and nothing to agree on beforehand. Spaced for reading aloud; the
+   * digits alone go on the wire.
+   */
+  public var pairCode: String by mutableStateOf(formatPairCode(random.nextInt(PAIR_CODE_BOUND)))
+    private set
+
+  /**
+   * A scanned QR's code is being offered to the Mac, even though this host may already be paired.
+   */
+  private var qrPairPending: Boolean = false
+
+  /**
+   * Milliseconds left on [pairCode], counted down by the same loop that polls.
+   *
+   * Observable even though it is private: [pairTtl] is derived from it, and a plain field would
+   * leave the countdown on screen frozen at 5:00 while the value underneath it ran out.
+   */
+  private var pairMillisLeft: Long by mutableStateOf(PAIR_TTL_MS)
+
+  public val pairTtl: String
+    get() {
+      val seconds = (pairMillisLeft / 1000L).coerceAtLeast(0L)
+      return "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
+    }
+
+  public var wakeOnLan: Boolean by mutableStateOf(true)
+    private set
+
+  public var confirmDestructive: Boolean by mutableStateOf(true)
+    private set
+
+  public var refreshInterval: String by mutableStateOf("1 s")
+    private set
+
+  // --- appearance -------------------------------------------------------
+  public var darkTheme: Boolean by mutableStateOf(persistence.darkTheme)
+    private set
+
+  // --- home -------------------------------------------------------------
+  public var editMode: Boolean by mutableStateOf(false)
+    private set
+
+  public val hiddenWidgets: SnapshotStateList<String> =
+      persistence.hiddenWidgets.toMutableStateList()
+
+  // --- apps -------------------------------------------------------------
+  public var module: String by mutableStateOf("claude")
+    private set
+
+  public var appsView: AppsView by mutableStateOf(AppsView.Dashboards)
+    private set
+
+  public val installed: SnapshotStateList<String> = persistence.installed.toMutableStateList()
+
+  /**
+   * The pull request whose buttons are showing, as `repo#number`; null when none is.
+   *
+   * Approve, Merge and Auto-merge on every row put an orange Merge button under each PR on the
+   * list, one mis-aimed thumb from a dialog nobody meant to open. The buttons appear under the one
+   * row that was tapped.
+   */
+  public var expandedPr: String? by mutableStateOf(null)
+    private set
+
+  // --- remote -----------------------------------------------------------
+
+  /** Which [RemoteSection]s are open, remembered across launches. */
+  public var remoteOpenSections: Set<String> by mutableStateOf(persistence.remoteOpenSections)
+    private set
+
+  public fun isRemoteSectionOpen(id: String): Boolean = id in remoteOpenSections
+
+  public fun toggleRemoteSection(id: String) {
+    remoteOpenSections =
+        if (id in remoteOpenSections) remoteOpenSections - id else remoteOpenSections + id
+    persistence.remoteOpenSections = remoteOpenSections
+  }
+
+  // --- macros -----------------------------------------------------------
+  public val userMacros: SnapshotStateList<Macro> = persistence.userMacros.toMutableStateList()
+  public var macroEditorOpen: Boolean by mutableStateOf(false)
+    private set
+
+  public var macroName: String by mutableStateOf("")
+    private set
+
+  public var macroCommand: String by mutableStateOf("")
+    private set
+
+  public var macroKind: MacroKind by mutableStateOf(MacroKind.Ssh)
+    private set
+
+  public var macroConfirm: Boolean by mutableStateOf(false)
+    private set
+
+  // --- media ------------------------------------------------------------
+  public var playing: Boolean by mutableStateOf(true)
+    private set
+
+  public var volume: Int by mutableStateOf(62)
+    private set
+
+  public var brightness: Int by mutableStateOf(80)
+    private set
+
+  public var mirror: Boolean by mutableStateOf(false)
+    private set
+
+  // --- trackpad and keys ------------------------------------------------
+  /**
+   * Whether the Mac is actually reachable.
+   *
+   * The trackpad's only honest indicator. Without it a connected pad and a dead one are visually
+   * identical, and a swipe that does nothing leaves the user guessing between Bluetooth, the app
+   * and themselves.
+   */
+  public var hidLink: HidLinkState by mutableStateOf(HidLinkState.Unavailable)
+    private set
+
+  /**
+   * The trackpad caption.
+   *
+   * Derived, never assigned. It used to be set to live finger coordinates -- "412 · 380" -- which
+   * are phone pixels: they correspond to nothing on the Mac and change while nobody is looking at
+   * them. What the surface knows and the user cannot infer is whether it is connected.
+   */
+  public val pointerLabel: String
+    get() =
+        when (hidLink) {
+          HidLinkState.Connected -> POINTER_HINT
+          HidLinkState.WaitingForHost -> "connecting to $hostShortName…"
+          HidLinkState.Unavailable -> "bluetooth link down · tap Reconnect"
+        }
+
+  public var keyboardOpen: Boolean by mutableStateOf(false)
+    private set
+
+  /** Whether the trackpad tuning controls are showing. */
+  public var tuningOpen: Boolean by mutableStateOf(false)
+    private set
+
+  /**
+   * How the trackpad feels.
+   *
+   * Observable so the controls redraw, and written straight through to [Persistence] on every
+   * change: this is tuned by feel, one tap at a time, and a setting that survived only until the
+   * next launch would make the whole exercise pointless.
+   */
+  public var tuning: TrackpadTuning by mutableStateOf(persistence.trackpadTuning)
+    private set
+
+  // --- the Mac agent ------------------------------------------------------
+
+  /** Where the selected agent is; blank means none and the dashboards stay simulated. */
+  public val agentUrl: String
+    get() = selectedHost?.url.orEmpty()
+
+  /** What the user is typing on the Hosts screen; applied by [applyAgentUrl], not per keystroke. */
+  // Shown as what will be dialled, not as typed: a stray space the keyboard
+  // inserted would otherwise sit in the field looking like a tolerated typo.
+  public var agentUrlDraft: String by
+      mutableStateOf(
+          persistence.hosts.firstOrNull()?.url.orEmpty().let {
+            if (it.isBlank()) it else AgentClient.normalize(it).substringAfter("://")
+          })
+    private set
+
+  /** The selected host's name, edited on the same plate as its address. */
+  public var hostAliasDraft: String by
+      mutableStateOf(persistence.hosts.firstOrNull()?.alias.orEmpty())
+    private set
+
+  /** The address typed into the "Add a Mac" row. Separate so it cannot overwrite the one above. */
+  public var newHostDraft: String by mutableStateOf("")
+    private set
+
+  public var metricsSource: MetricsSource by
+      mutableStateOf(
+          if (persistence.hosts.isEmpty()) MetricsSource.Simulated else MetricsSource.Unreachable)
+    private set
+
+  /** The last reading the agent gave. Kept, frozen, while it is unreachable. */
+  public var agentMetrics: AgentMetrics? by mutableStateOf(null)
+    private set
+
+  public var agentHost: AgentHost? by mutableStateOf(null)
+    private set
+
+  /** Why the last poll failed, for the Hosts screen. Blank while live. */
+  public var agentError: String by mutableStateOf("")
+    private set
+
+  /**
+   * The bearer token pairing issued. Blank means read-only.
+   *
+   * The whole act half of the contract hangs off this one string: with it the phone can run
+   * commands, move the clipboard, set the volume and restart the machine; without it every one of
+   * those says "not paired" rather than doing nothing quietly.
+   */
+  public val agentToken: String
+    get() = selectedHost?.token.orEmpty()
+
+  public val paired: Boolean
+    get() = agentToken.isNotBlank()
+
+  /**
+   * The Mac answered 401/403 to the token this phone held, and the token was dropped.
+   *
+   * Only changes the wording ("stopped accepting this phone" rather than "not paired"): a token
+   * issued since makes [pairing] read Paired whatever this says, so a stale refusal can never
+   * outlive the pairing that fixed it. Cleared anyway on success and on switching Macs.
+   */
+  public var pairRejected: Boolean by mutableStateOf(false)
+    private set
+
+  /** Whether this phone may act on the selected Mac, or only look. See [Derive.Pairing]. */
+  public val pairing: Derive.Pairing
+    get() =
+        Derive.pairing(hasAgent = agentUrl.isNotBlank(), hasToken = paired, rejected = pairRejected)
+
+  /** The Mac is configured but will refuse every change from this phone. */
+  public val needsPairing: Boolean
+    get() = Derive.needsPairing(pairing)
+
+  /** The top-of-screen banner's label and body, or null. */
+  public val pairingBanner: Pair<String, String>?
+    get() = Derive.pairingBanner(pairing, hostShortName)
+
+  /**
+   * Bumped by "Pair now". The Hosts screen watches it and scrolls the pairing plate into view, so
+   * the button lands on the code rather than at the top of a long settings page.
+   */
+  public var pairFocusRequest: Int by mutableStateOf(0)
+    private set
+
+  /** [pairCode] as the Mac's `pair` subcommand wants it: six digits, no space. */
+  public val pairDigits: String
+    get() = pairCode.filterNot { it.isWhitespace() }
+
+  /** en0's address, kept because a sleeping Mac cannot be asked for it. */
+  public val agentMac: String
+    get() = selectedHost?.mac.orEmpty()
+
+  // Each of the contract's read endpoints, exactly as it answered. Null means
+  // "not asked yet"; an AgentList that says available:false carries the Mac's
+  // own reason, and the screens print that instead of an empty list.
+  public var agentProcesses: List<AgentProcess>? by mutableStateOf(null)
+    private set
+
+  public var agentOllama: AgentOllama? by mutableStateOf(null)
+    private set
+
+  /** HomeSpeaker on the Mac, from `/v1/homespeaker`; null until the first answer. */
+  public var agentHomeSpeaker: AgentHomeSpeaker? by mutableStateOf(null)
+    private set
+
+  /** The default speaker's volume, from `/v1/homespeaker/volume`; null until asked. */
+  public var agentSpeakerVolume: AgentSpeakerVolume? by mutableStateOf(null)
+    private set
+
+  /** A volume change is on its way; it takes seconds (Google reports ~3 s late). */
+  public var speakerVolumeBusy: Boolean by mutableStateOf(false)
+    private set
+
+  /** An action is running on HomeSpeaker (discovery, voice preview, agent hook, etc.). */
+  public var homeSpeakerBusy: String? by mutableStateOf(null)
+    private set
+
+  /** Recent status notice from a HomeSpeaker action (success or failure). */
+  public var homeSpeakerNotice: Pair<String, StatusTone>? by mutableStateOf(null)
+    private set
+
+  /** The announce box on the HomeSpeaker dashboard. Cleared once the Mac has spoken it. */
+  public var announceDraft: String by mutableStateOf("")
+    private set
+
+  /** Sony Google TV state from `GET /v1/tv`; null until the first answer. */
+  public var agentTv: AgentTv? by mutableStateOf(null)
+    private set
+
+  /** URL draft for casting to SmartTube on the Sony TV dashboard. */
+  public var tvCastDraft: String by mutableStateOf("")
+    private set
+
+  private var tvBusyAction: String? by mutableStateOf(null)
+  private var tvLastFeedback: String by mutableStateOf("")
+  private var tvLastFeedbackTone: TerminalTone by mutableStateOf(TerminalTone.Dim)
+  private var tvReconnectCount: Int by mutableStateOf(0)
+
+  public var agentTools: AgentTools? by mutableStateOf(null)
+    private set
+
+  public var agentAntigravity: AgentAntigravity? by mutableStateOf(null)
+    private set
+
+  /** The last PromQL reply, for the Grafana-panel module. */
+  public var promqlResult: AgentPromql? by mutableStateOf(null)
+    private set
+
+  public var agentVms: AgentList<AgentVm>? by mutableStateOf(null)
+    private set
+
+  public var agentContainers: AgentList<AgentContainer>? by mutableStateOf(null)
+    private set
+
+  public var agentK8s: AgentList<AgentNode>? by mutableStateOf(null)
+    private set
+
+  public var agentSessions: AgentSessions? by mutableStateOf(null)
+    private set
+
+  /** The Mac's real output volume. The only one of these controls that reads back. */
+  public var agentAudio: AgentAudio? by mutableStateOf(null)
+    private set
+
+  // The v1.2 read surface.
+  public var agentClaudeSessions: List<AgentClaudeSession>? by mutableStateOf(null)
+    private set
+
+  // --- v1.6: Claude Code permission prompts ---------------------------------
+
+  /**
+   * Whether the phone-approval hook is installed in Claude Code on the Mac, so its permission
+   * prompts come to this phone first. The Mac's value, read back from `GET /v1/claude/permissions`
+   * -- never what the phone last asked for.
+   */
+  public var claudeEnabled: Boolean by mutableStateOf(false)
+    private set
+
+  /**
+   * The change on its way to the Mac: true installing, false removing, null when none is. The
+   * toggle is disabled and says which while it is set.
+   */
+  public var claudeEnabledPending: Boolean? by mutableStateOf(null)
+    private set
+
+  /**
+   * Why the last install or removal failed, verbatim from the Mac (`settings.json` is not valid
+   * JSON, …). Blank when it did not. Shown under the toggle, which stays where the Mac left it.
+   */
+  public var claudeEnabledError: String by mutableStateOf("")
+    private set
+
+  /** How long the agent holds a prompt before the Mac's own dialog takes over, in seconds. */
+  public var claudeWaitSeconds: Int by mutableStateOf(0)
+    private set
+
+  /** The prompts the agent is holding for this phone, oldest first. */
+  public var claudePending: List<PendingPermission> by mutableStateOf(emptyList())
+    private set
+
+  /**
+   * Whether the agent has the endpoint at all. Null until it has been asked; false after a 404,
+   * which is an agent older than v1.6 -- the approvals UI is then replaced by one line saying to
+   * update it, and the transcript heuristic goes back to counting "waiting".
+   */
+  public var claudeApprovalsSupported: Boolean? by mutableStateOf(null)
+    private set
+
+  /** Why the last read of the prompts failed, blank when it did not. */
+  public var claudeApprovalsError: String by mutableStateOf("")
+    private set
+
+  /** The prompt whose Deny was tapped and is showing its reason field, if any. */
+  public var claudeDenyingId: String? by mutableStateOf(null)
+    private set
+
+  /** The optional reason typed under that Deny. */
+  public var claudeDenyReason: String by mutableStateOf("")
+    private set
+
+  /**
+   * Ids answered from here whose answer may not have reached a poll yet.
+   *
+   * A poll that left before the decision can come back after it still listing the prompt, and the
+   * card would reappear for a second after the tap that removed it -- inviting a second tap that
+   * earns a confusing 404. Pruned once the agent stops listing them.
+   */
+  private val claudeDecided = mutableSetOf<String>()
+
+  /** Polls skipped since a 404, so an agent upgraded in place is noticed without a restart. */
+  private var claudeUnsupportedSkips = 0
+
+  // --- v1.7: Antigravity parity ----------------------------------------------
+
+  /** `/v1/antigravity/sessions`; null until it has answered. */
+  public var agentAntigravitySessions: AgentAntigravitySessions? by mutableStateOf(null)
+    private set
+
+  /**
+   * Whether the agent has the sessions endpoint. False after a 404 -- an agent older than v1.7 --
+   * and the dashboard then shows what it always did.
+   */
+  public var antigravitySessionsSupported: Boolean? by mutableStateOf(null)
+    private set
+
+  /** The conversation Send continues; null starts a new one. */
+  public var selectedAntigravityId: String? by mutableStateOf(null)
+    private set
+
+  /** The Antigravity prompt box. Its own, so typing on one dashboard does not fill the other. */
+  public var antigravityPrompt: String by mutableStateOf("")
+    private set
+
+  /** This phone's exchanges with Antigravity. */
+  public val antigravityTranscript: SnapshotStateList<TerminalLine> =
+      emptyList<TerminalLine>().toMutableStateList()
+
+  /** An Antigravity prompt is streaming; its Send button reads Stop. */
+  public var antigravityRunning: Boolean by mutableStateOf(false)
+    private set
+
+  public var agentPrs: AgentList<AgentPr>? by mutableStateOf(null)
+    private set
+
+  public var agentArgo: AgentList<AgentArgoApp>? by mutableStateOf(null)
+    private set
+
+  /**
+   * Whether the agent has anywhere to publish notifications. Null until `/healthz` has answered.
+   */
+  public var agentNotify: AgentNotifyStatus? by mutableStateOf(null)
+    private set
+
+  // --- the phone bridge -------------------------------------------------
+
+  /** Whether the bridge service should be running. Off until someone turns it on. */
+  public var bridgeEnabled: Boolean by mutableStateOf(persistence.bridgeEnabled)
+    private set
+
+  /** Whether the outbound link to the Mac agent is up right now. */
+  public var bridgeLinked: Boolean by mutableStateOf(false)
+    private set
+
+  /**
+   * What the link is doing when it is not up: "connecting…", "not paired", the socket's own error.
+   *
+   * Shown verbatim on the plate, because "not linked" with no reason is the state nobody can fix.
+   */
+  public var bridgeLinkStatus: String by mutableStateOf("off")
+    private set
+
+  /**
+   * Why the bridge is on and still not linked, judged from the phone's side as well as the
+   * service's. Reachability counts only once a poll has actually failed (`agentError` is blank
+   * until then), so a cold start does not flash "not answering" before the first reply.
+   */
+  public val bridgeProblem: Derive.BridgeProblem
+    get() =
+        Derive.bridgeProblem(
+            enabled = bridgeEnabled && bridgeAvailable,
+            linked = bridgeLinked,
+            pairing = pairing,
+            reachable = isLive || agentError.isBlank(),
+            linkStatus = bridgeLinkStatus,
+        )
+
+  /** [bridgeProblem] in a sentence, or null when there is nothing to say. */
+  public val bridgeProblemText: String?
+    get() = Derive.bridgeProblemText(bridgeProblem, hostShortName, bridgeLinkStatus)
+
+  /** When the trust window shuts, epoch millis; 0 means it was never opened. */
+  public var trustUntil: Long by mutableStateOf(0L)
+    private set
+
+  /** The outbound call waiting for an answer, if any. */
+  public var pendingApproval: BridgePending? by mutableStateOf(null)
+    private set
+
+  /** The last [BridgePolicy.AUDIT_LIMIT] tool calls, newest first. */
+  public var bridgeAudit: List<BridgeAuditEntry> by mutableStateOf(emptyList())
+    private set
+
+  /** Every permission the bridge's tools need, with its state. Refreshed when the screen shows. */
+  public var bridgePermissions: List<BridgePermissionState> by mutableStateOf(emptyList())
+    private set
+
+  /**
+   * The clock the trust countdown is read against.
+   *
+   * Held as state and advanced by the tick rather than read from `System` inside the getter: a
+   * value Compose cannot observe would leave "59 min left" on screen until something unrelated
+   * caused a recomposition, which is the same failure as a stopped clock.
+   */
+  public var bridgeNowMs: Long by mutableStateOf(System.currentTimeMillis())
+    private set
+
+  /**
+   * Which session a supplemental instruction would be resumed into.
+   *
+   * Null means none picked, and Send then falls back to a NEW `claude -p` run rather than guessing
+   * a session -- sending an instruction into someone else's half-finished conversation because it
+   * happened to be first in the list is the failure worth avoiding here.
+   */
+  public var selectedSessionId: String? by mutableStateOf(null)
+    private set
+
+  // --- screen peek ------------------------------------------------------
+  //
+  // Every capture is a tap. There is no timer here on purpose: a remote that
+  // silently re-screenshots someone's Mac once a second is a different piece
+  // of software from one that shows a still when asked.
+
+  public var peekOpen: Boolean by mutableStateOf(false)
+    private set
+
+  /** The last JPEG the Mac sent, undecoded. Null until one arrives. */
+  public var peekImage: ByteArray? by mutableStateOf(null)
+    private set
+
+  public var peekLoading: Boolean by mutableStateOf(false)
+    private set
+
+  /**
+   * Why there is no picture, in the Mac's own words.
+   *
+   * Almost always "Screen Recording is not granted to the agent" plus the exact path through System
+   * Settings -- which is the entire value of the field: no network error message would tell anyone
+   * how to fix it, and a blank plate would tell them nothing at all.
+   */
+  public var peekReason: String by mutableStateOf("")
+    private set
+
+  /**
+   * The part of the display the plate is showing. [Derive.PeekRegion.Full] until a pinch; the agent
+   * crops the native capture to it, which is what makes zoom show detail instead of blur.
+   */
+  public var peekRegion: Derive.PeekRegion by mutableStateOf(Derive.PeekRegion.Full)
+    private set
+
+  /**
+   * Whether a streamed command is in flight, and what it is.
+   *
+   * The pair the Stop button hangs off. Without it a four-minute build and a command that died
+   * instantly look identical: output stops in both cases, and only one of them is still running.
+   */
+  public var commandRunning: Boolean by mutableStateOf(false)
+    private set
+
+  public var runningLabel: String by mutableStateOf("")
+    private set
+
+  /** The open connection, so Stop can close it. Closing IS the cancellation. */
+  private var runningHandle: ExecStreamHandle? = null
+
+  /**
+   * Whether the activity is on screen.
+   *
+   * Decides whether a finished command deserves a notification (telling someone who is watching the
+   * output that the output has arrived is noise), and what the poll asks the Mac for: off screen,
+   * only whether it still answers. Snapshot state so the poll wakes when it flips.
+   */
+  private var foreground: Boolean by mutableStateOf(true)
+
+  /**
+   * GPU and Neural Engine power, in watts, from `tools/ops/macos-power-agent` via Prometheus.
+   *
+   * Watts, not percent. There is no "GPU load" figure on Apple silicon that a process can read
+   * without root, and the number this replaced was a random walk drawn as a percentage meter -- the
+   * most confidently wrong thing on the screen. Null means no Prometheus is configured.
+   */
+  public var gpuWatts: Double? by mutableStateOf(null)
+    private set
+
+  public var aneWatts: Double? by mutableStateOf(null)
+    private set
+
+  /** Why there is no power reading, when there is none. */
+  public var powerQueryReason: String by mutableStateOf("")
+    private set
+
+  public var typed: String by mutableStateOf("")
+    private set
+
+  // --- agent and console ------------------------------------------------
+  public var prompt: String by mutableStateOf("")
+    private set
+
+  public var command: String by mutableStateOf("")
+    private set
+
+  // Seeded with the canned demo ONLY while no agent is configured. With a
+  // real Mac behind the console, a transcript that opens on a conversation
+  // nobody had and a terminal showing commands nobody ran is the exact kind
+  // of pretending the LIVE tag promises not to do.
+  private val demo: Boolean = persistence.hosts.isEmpty()
+
+  public val terminal: SnapshotStateList<TerminalLine> =
+      (if (demo) MockHost.initialTerminal else emptyList()).toMutableStateList()
+  public val agentTranscript: SnapshotStateList<TerminalLine> =
+      (if (demo) MockHost.initialAgentTranscript else emptyList()).toMutableStateList()
+  public var agentPaused: Boolean by mutableStateOf(false)
+    private set
+
+  /** Commands actually run from this phone, newest first. Persisted. */
+  private val ranCommands: SnapshotStateList<String> =
+      persistence.recentCommands.toMutableStateList()
+
+  /**
+   * The chips under the console input.
+   *
+   * Real history once there is any; the canned list only while there is none, because an empty row
+   * of chips teaches nobody what the console is for.
+   */
+  public val recentCommands: List<String>
+    get() =
+        when {
+          ranCommands.isNotEmpty() -> ranCommands.toList()
+          // Canned examples only in simulated mode: on a real Mac a chip
+          // labelled "recent" would run a command nobody here ever ran.
+          agentUrl.isBlank() -> MockHost.recentCommands
+          else -> emptyList()
+        }
+
+  // Same rule as the terminal: the demo event stream only when there is no
+  // real Mac to produce one.
+  public val logs: SnapshotStateList<LogEntry> =
+      (if (demo)
+              listOf(
+                  LogEntry("04:37:02", "ok", "homelab · 3/3 nodes ready, no drift"),
+                  LogEntry("04:36:51", "warn", "lima · k8s-node-3 stopped (manual)"),
+                  LogEntry("04:36:44", "info", "claude code · session 2 resumed"),
+                  LogEntry("04:35:10", "ok", "antigravity · build #412 green"),
+                  LogEntry("04:31:00", "info", "atlas · connected via tailscale (4 ms)"),
+              )
+          else emptyList())
+          .toMutableStateList()
+
+  // --- clipboard and power ---------------------------------------------
+  public var clipboard: String by
+      mutableStateOf("https://github.com/VitruvianSoftware/vitruvian-core/pull/1551")
+    private set
+
+  public var dialog: DialogKind? by mutableStateOf(null)
+    private set
+
+  public var confirmText: String by mutableStateOf("")
+    private set
+
+  // --- PromQL panel -----------------------------------------------------
+  // This Mac's own power series: a handful of results, and the metric the
+  // dashboards already depend on. The old default matched every CPU on
+  // every node in the lab and came back larger than the proxy allows.
+  public var promql: String by mutableStateOf("mac_soc_power_watts")
+    private set
+
+  public var promqlStatus: String by mutableStateOf("Run a query to fill this panel")
+    private set
+
+  // --- live series ------------------------------------------------------
+  public val cpu: SnapshotStateList<Int> =
+      List(SERIES_LENGTH) { 18 + (12 * abs(sin(it / 3.0))).roundToInt() }.toMutableStateList()
+  public val net: SnapshotStateList<Int> =
+      List(SERIES_LENGTH) { 10 + (40 * abs(sin(it / 2.2))).roundToInt() }.toMutableStateList()
+  public var gpu: Int by mutableStateOf(31)
+    private set
+
+  public var ane: Int by mutableStateOf(12)
+    private set
+
+  public var temperature: Int by mutableStateOf(48)
+    private set
+
+  public var fanRpm: Int by mutableStateOf(1200)
+    private set
+
+  public var powerDraw: Int by mutableStateOf(18)
+    private set
+
+  // --- derived ----------------------------------------------------------
+
+  /** Navigation is locked to Hosts until a Mac is paired. */
+  public val effectiveScreen: Screen
+    get() = if (connection == Connection.Unpaired) Screen.Hosts else screen
+
+  public val isOffline: Boolean
+    get() = connection == Connection.Offline
+
+  public val isUnpaired: Boolean
+    get() = connection == Connection.Unpaired
+
+  /**
+   * [connection] as the shell shows it: [Connection.NotPaired] whenever a configured Mac holds no
+   * token for this phone. Derived, not stored, so it can never disagree with the token.
+   */
+  public val shellConnection: Connection
+    get() =
+        if (connection == Connection.Connected && needsPairing) Connection.NotPaired else connection
+
+  /**
+   * The Hosts list, one row per saved Mac.
+   *
+   * The mock pair is shown only while nothing real is saved -- that is the app with no Mac yet, and
+   * it is the one case where a simulated host is honest. The moment a real one exists, `forge`
+   * disappears entirely rather than sitting under it looking like a second machine that is asleep.
+   *
+   * Only the SELECTED host is polled, so only it can claim live or unreachable. The others say
+   * "saved", which is all this phone actually knows about them.
+   */
+  public val hostRows: List<Host>
+    get() =
+        when {
+          isUnpaired -> emptyList()
+          hosts.isEmpty() -> MockHost.hosts
+          else -> hosts.map(::hostRow)
+        }
+
+  private fun hostRow(entry: AgentHostEntry): Host {
+    val current = entry.id == selectedHost?.id
+    val live = agentHost.takeIf { current }
+    val address = AgentClient.normalize(entry.url).substringAfter("://")
+    return Host(
+        id = entry.id,
+        name =
+            if (live != null) "${entry.alias} · ${live.chip}" else entry.alias.ifBlank { address },
+        subtitle =
+            if (live != null)
+                "$address · macOS ${live.osVersion} · ${Format.memoryBytes(live.memoryBytes)}"
+            else address,
+        // Live but unpaired is amber, not green: the numbers are real, the
+        // switches are not. The tag says which half is missing.
+        tone =
+            when {
+              !current -> StatusTone.Neutral
+              metricsSource == MetricsSource.Live && needsPairing -> StatusTone.Warn
+              metricsSource == MetricsSource.Live -> StatusTone.Ok
+              else -> StatusTone.Crit
+            },
+        tag =
+            when {
+              !current -> "saved"
+              metricsSource == MetricsSource.Live && needsPairing -> "not paired"
+              else -> metricsSource.label
+            },
+        tagTone =
+            when {
+              !current -> TagTone.Outline
+              metricsSource == MetricsSource.Live && needsPairing -> TagTone.Warn
+              metricsSource == MetricsSource.Live -> TagTone.Ok
+              else -> TagTone.Sanguine
+            },
+    )
+  }
+
+  /** The short name the top bar and rail show - `atlas`, not the full row title. */
+  public val hostShortName: String
+    get() =
+        when {
+          isUnpaired -> "no host"
+          // No Mac saved: the app is simulating, and the mock's own name is
+          // what every other simulated figure on screen belongs to.
+          hosts.isEmpty() -> MockHost.hosts.first().name.substringBefore(" · ")
+          else -> selectedHost?.alias?.ifBlank { null } ?: agentHost?.hostname ?: "no host"
+        }
+
+  /**
+   * The alias, or the Mac's hostname cut down to something readable.
+   *
+   * `James-MacBook-Pro.local` becomes `james-macbook-pro`: the domain says nothing a chip has room
+   * for, and the capitals are Apple's, not the user's. Blank when no agent has answered yet, which
+   * is what sends [hostShortName] to the host list for a name.
+   */
+  private fun shortHostName(): String =
+      when {
+        !selectedHost?.alias.isNullOrBlank() -> selectedHost?.alias.orEmpty()
+        else -> agentHost?.hostname?.let(Format::shortHost).orEmpty()
+      }
+
+  /** The chip's text: the short name, suffixed when unreachable. */
+  public val hostChipText: String
+    get() =
+        when {
+          isUnpaired -> "no host"
+          isOffline -> "$hostShortName · offline"
+          shellConnection == Connection.NotPaired -> "$hostShortName · not paired"
+          else -> hostShortName
+        }
+
+  public val hostTone: StatusTone
+    get() =
+        when (shellConnection) {
+          Connection.Connected -> StatusTone.Ok
+          Connection.Offline -> StatusTone.Crit
+          Connection.Unpaired -> StatusTone.Neutral
+          Connection.NotPaired -> StatusTone.Warn
+        }
+
+  public val connectionWord: String
+    get() =
+        when (shellConnection) {
+          Connection.Connected -> "connected"
+          Connection.Offline -> "unreachable"
+          Connection.Unpaired -> "unpaired"
+          Connection.NotPaired -> Derive.connectionWord(pairing, "connected")
+        }
+
+  /** The line under the host name on Home: real when the agent has answered, the mock otherwise. */
+  public val hostSubline: String
+    get() {
+      val h = agentHost ?: return "macOS 26.1 · Tailscale · 4 ms"
+      val up = agentMetrics?.uptimeSeconds ?: 0L
+      val days = up / SECONDS_PER_DAY
+      return "macOS ${h.osVersion} · agent v${h.agentVersion} · up ${days}d"
+    }
+
+  public val metricsTagTone: TagTone
+    get() =
+        when (metricsSource) {
+          MetricsSource.Live -> TagTone.Ok
+          MetricsSource.Unreachable -> TagTone.Sanguine
+          MetricsSource.Simulated -> TagTone.Outline
+        }
+
+  /** The host part of the configured agent URL, for display. */
+  private fun agentHostLabel(): String =
+      AgentClient.normalize(agentUrl).substringAfter("://").substringBefore('/')
+
+  /**
+   * Whether what is on screen came from the Mac.
+   *
+   * The single switch every "live or mock" decision below turns on. Unreachable is deliberately NOT
+   * live: the last reading stays frozen on screen and tagged, but nothing derives new claims from
+   * it -- a process list from four minutes ago presented as the process list is a lie with a
+   * timestamp.
+   */
+  public val isLive: Boolean
+    get() = metricsSource == MetricsSource.Live
+
+  // --- the Mac screen, live or mock -------------------------------------
+  //
+  // Each pair is (rows, notice). A non-null notice means the agent could not
+  // produce the list and said why; the screen prints the reason IN PLACE OF
+  // the rows, which is the contract's own rule. A list that is merely empty
+  // is still shown as empty -- "no containers running" is a real answer.
+
+  public val processes: List<Process>
+    get() {
+      if (!isLive) return MockHost.processes
+      return agentProcesses.orEmpty().map {
+        Process(
+            name = it.name,
+            cpu = it.cpuPercent.roundToInt(),
+            memory = Format.memoryBytes(it.memoryBytes),
+        )
+      }
+    }
+
+  public val processesNotice: Notice?
+    get() =
+        if (isLive && agentProcesses == null)
+            Notice("Sampling…", "the agent is taking its first reading")
+        else null
+
+  public val vms: List<Vm>
+    get() {
+      val live = agentVms
+      if (!isLive || live == null || !live.available)
+          return if (isLive) emptyList() else MockHost.vms
+      return live.items.map { vm ->
+        val running = vm.status.equals("Running", ignoreCase = true)
+        Vm(
+            name = vm.name,
+            subtitle =
+                Format.parts(
+                    vm.arch, "${vm.cpus} cpu", Format.memoryBytes(vm.memoryBytes), vm.vmType),
+            tone = if (running) StatusTone.Ok else StatusTone.Warn,
+            tag = vm.status.lowercase(Locale.ROOT),
+            tagTone = if (running) TagTone.Ok else TagTone.Warn,
+        )
+      }
+    }
+
+  public val vmsNotice: Notice?
+    get() = liveNotice(agentVms, "limactl") { "Lima VMs unavailable" }
+
+  public val containers: List<Container>
+    get() {
+      val live = agentContainers
+      if (!isLive || live == null || !live.available) {
+        return if (isLive) emptyList() else MockHost.containers
+      }
+      // Pause sandboxes gone and a pod's containers on one row; see
+      // Derive.groupContainers for why the raw `docker ps` list was unreadable.
+      return Derive.groupContainers(live.items, { it.name }, { it.image }).map { group ->
+        if (!group.pod) {
+          val c = group.members.single()
+          Container(c.name, c.image, c.status)
+        } else {
+          Container(
+              name = group.title,
+              // The workloads by their own names -- the second field of
+              // `k8s_<container>_<pod>_...` -- rather than a list of images.
+              subtitle =
+                  group.members.joinToString(", ") { c ->
+                    c.name.split('_').getOrElse(1) { c.name }
+                  },
+              trailing = group.members.first().status,
+          )
+        }
+      }
+    }
+
+  /** Pause sandboxes left out of [containers], so the list can say it hid them. */
+  public val hiddenPauseContainers: Int
+    get() {
+      val live = agentContainers
+      if (!isLive || live == null || !live.available) return 0
+      return Derive.pauseCount(live.items, { it.name }, { it.image })
+    }
+
+  public val containersNotice: Notice?
+    get() = liveNotice(agentContainers, "docker / podman", Format::containerTitle)
+
+  /**
+   * The K3s nodes, which used to share a section with the Lima VMs.
+   *
+   * They are separate endpoints with separate failure modes: `limactl` can be missing while
+   * `kubectl` works, and one list showing both could only report the worse of the two.
+   */
+  public val nodes: List<Vm>
+    get() {
+      val live = agentK8s
+      if (!isLive || live == null || !live.available) return emptyList()
+      return live.items.map { node ->
+        Vm(
+            name = node.name,
+            subtitle = "${node.roles.joinToString(", ").ifBlank { "no role" }} · ${node.version}",
+            tone = if (node.ready) StatusTone.Ok else StatusTone.Crit,
+            tag = if (node.ready) "ready" else "not ready",
+            tagTone = if (node.ready) TagTone.Ok else TagTone.Sanguine,
+        )
+      }
+    }
+
+  public val nodesNotice: Notice?
+    get() =
+        if (!isLive) Notice("No cluster behind this screen", "simulated")
+        else liveNotice(agentK8s, "kubectl") { "K3s nodes unavailable" }
+
+  /** The section header, which carries the count and so must not invent one. */
+  public val containersLabel: String
+    get() {
+      val live = agentContainers
+      if (!isLive) return "Docker · ${MockHost.containers.size} containers"
+      if (live == null) return "Containers"
+      if (!live.available) return "Containers · unavailable"
+      val runtime = live.detail.ifBlank { "containers" }
+      return "$runtime · ${live.items.size} running"
+    }
+
+  /**
+   * GPU and Neural Engine, as the Mac can actually report them.
+   *
+   * A percentage meter is deliberately absent here. Watts are not a fraction of anything the phone
+   * knows, and the meter that used to sit under these numbers was drawing a random walk.
+   */
+  public val gpuPlate: HonestMetric
+    get() = powerPlate("GPU", gpu, "Metal · 2 clients", gpuWatts)
+
+  public val anePlate: HonestMetric
+    get() = powerPlate("Neural Engine", ane, "ollama · llama3.3", aneWatts)
+
+  private fun powerPlate(
+      label: String,
+      simulated: Int,
+      simulatedSub: String,
+      watts: Double?,
+  ): HonestMetric =
+      when {
+        !isLive -> HonestMetric(label, "$simulated%", simulatedSub, simulated)
+        watts != null -> HonestMetric(label, Format.watts(watts), "power, not load", null)
+        else -> HonestMetric(label, "n/a", powerQueryReason.ifBlank { POWER_UNAVAILABLE }, null)
+      }
+
+  /**
+   * Thermals on the Mac screen, mirroring the Home widget rather than contradicting it.
+   *
+   * Two tiles claiming different temperatures for one machine is worse than one tile saying it
+   * cannot read the SoC, which is the truth: there is no die temperature and no fan speed without
+   * root, so this reports throttling state and the battery's own sensor.
+   *
+   * What it no longer does is say so HERE. Five plates each carrying their own "n/a" turned the
+   * screen into a list of apologies; [computeFootnote] says it once, at the bottom, and every plate
+   * above it just shows what it has.
+   */
+  public val thermalPlate: HonestMetric
+    get() {
+      val m = agentMetrics
+      if (!isLive || m == null) {
+        return HonestMetric(
+            "Thermals",
+            "$temperature°",
+            "fans $fanRpm rpm",
+            temperature,
+            warn = temperature > THERMAL_WARN_C,
+        )
+      }
+      return HonestMetric(
+          label = "Thermals",
+          value = if (m.throttled) "${m.cpuSpeedLimitPercent}%" else "ok",
+          sub = Derive.batteryTemperatureLabel(m.batteryTemperatureC),
+          percent = if (m.throttled) 100 - m.cpuSpeedLimitPercent else null,
+          warn = m.throttled,
+      )
+    }
+
+  /**
+   * The line under the CPU spark.
+   *
+   * `top` reports one busy figure for the machine, not a P/E split -- that needs `powermetrics` and
+   * root. The line said "P-cores 34% · E-cores 12%" for numbers nothing had ever measured, and then
+   * said "P/E split n/a", which was true but is [computeFootnote]'s job. What it carries now is
+   * what this Mac actually reports: the load average and how many cores are sharing it.
+   */
+  public val cpuBreakdown: String
+    get() {
+      if (!isLive) return "P-cores 34% · E-cores 12%"
+      val m = agentMetrics ?: return "sampling…"
+      val cores = agentHost?.cores?.takeIf { it > 0 }?.let { "$it cores" }
+      return Format.parts("load ${"%.2f".format(m.load1)}", cores)
+    }
+
+  /**
+   * The one place the Mac screen admits what it cannot read.
+   *
+   * Every figure named here needs root (`powermetrics`), an SMC reader, or a second sampling call
+   * the agent does not make. Each used to be an "n/a" on the plate it belonged to; five of those
+   * across one screen read as a broken app rather than an honest one, and the honesty was harder to
+   * find, not easier. Null when nothing is being measured at all -- the simulated screen has a
+   * bigger caveat than this one, and it is already tagged.
+   */
+  public val computeFootnote: String?
+    get() =
+        if (!isLive) null
+        else
+            "Not readable without root: SoC temperature, fans, P/E split, swap, " +
+                "disk throughput."
+
+  public val memoryPlate: HonestMetric
+    get() {
+      val m = agentMetrics
+      if (!isLive || m == null) {
+        return HonestMetric(
+            "Memory pressure", "$MEMORY_PERCENT%", "26.4 / 64 GB · swap 0 B", MEMORY_PERCENT)
+      }
+      val pressure = (100 - m.memoryFreePercent).coerceIn(0, 100)
+      return HonestMetric(
+          label = "Memory pressure",
+          value = "$pressure%",
+          sub =
+              Format.parts(
+                  Format.memoryPair(m.memoryUsedBytes, m.memoryTotalBytes),
+                  "kernel free ${m.memoryFreePercent}%",
+              ),
+          percent = pressure,
+      )
+    }
+
+  /**
+   * app / wired / compressed / cached, which `vm_stat` gives and this agent does not read.
+   *
+   * Empty while live rather than one line saying so: that sentence was the fourth "not read" on the
+   * screen, and it now lives once in [computeFootnote].
+   */
+  public val memoryBreakdown: List<String>
+    get() =
+        if (isLive) emptyList()
+        else listOf("app 18.1 GB", "wired 4.2 GB", "compressed 2.1 GB", "cached 12 GB")
+
+  public val batteryPlate: HonestMetric
+    get() {
+      val m = agentMetrics
+      if (!isLive || m == null) {
+        return HonestMetric("Battery", "$BATTERY_PERCENT%", "$powerDraw W · on AC", BATTERY_PERCENT)
+      }
+      if (!m.batteryPresent) return HonestMetric("Battery", "n/a", "no battery", null)
+      return HonestMetric(
+          label = "Battery",
+          value = "${m.batteryPercent}%",
+          // On AC the battery's own draw is 0 by definition; the adapter's
+          // figure (API v1.5.1) is the one that says anything there.
+          sub = Derive.batteryPowerLabel(m.onAc, m.charging, m.drawWatts, m.systemWatts),
+          percent = m.batteryPercent,
+          warn = !m.onAc && m.batteryPercent < BATTERY_WARN_PERCENT,
+      )
+    }
+
+  public val diskPlate: HonestMetric
+    get() {
+      val m = agentMetrics
+      if (!isLive || m == null) {
+        return HonestMetric(
+            "Disk · Macintosh HD", "1.21 / 2 TB", "R 42 MB/s · W 8 MB/s", DISK_PERCENT)
+      }
+      val used = m.diskUsedPercent.roundToInt()
+      val fill = Derive.diskFill(m.diskUsedPercent)
+      return HonestMetric(
+          label = "Disk",
+          value = "$used%",
+          // How full, then how much room is left, which is the question anyone
+          // actually has. The data volume since API v1.5.1: `/` is the sealed
+          // system snapshot and read 1% on a disk that was 90% full.
+          sub =
+              Format.parts(
+                  if (m.diskTotalBytes > 0) Format.bytesPair(m.diskUsedBytes, m.diskTotalBytes)
+                  else m.diskUsedBytes.takeIf { it > 0 }?.let { "${Format.formatBytes(it)} used" },
+                  m.diskAvailableBytes.takeIf { it > 0 }?.let { "${Format.formatBytes(it)} free" },
+              ),
+          percent = used,
+          warn = fill == Derive.Fill.Warn,
+          crit = fill == Derive.Fill.Crit,
+      )
+    }
+
+  /** What the console is actually talking to. */
+  public val consoleSubtitle: String
+    get() =
+        when {
+          agentUrl.isBlank() -> "zsh · no agent configured"
+          else -> Format.parts("zsh -lc", hostShortName, "via the agent")
+        }
+
+  /** Where a PromQL query would go, named rather than asserted. */
+  public val promqlSource: String
+    get() =
+        when {
+          agentUrl.isBlank() -> "source · none · configure the agent on Hosts"
+          else -> "source · ${agentHostLabel()} · via the Mac agent"
+        }
+
+  /** The Mac screen's header line. */
+  public val computeSubline: String
+    get() {
+      val h = agentHost ?: return "Apple M4 Max · 16c CPU · 40c GPU · 64 GB"
+      return Format.parts(h.model, h.chip, "${h.cores} cores", Format.memoryBytes(h.memoryBytes))
+    }
+
+  // --- media --------------------------------------------------------------
+
+  /**
+   * What is playing, when anything can say so.
+   *
+   * Nothing can. macOS exposes no now-playing information to a shell without private frameworks or
+   * an extra helper, so the plate says that in as many words rather than keeping a track title that
+   * was invented in a mock. The transport buttons underneath are real HID and stay.
+   */
+  public val mediaTitle: String
+    get() = if (isLive) "Now playing · n/a" else if (playing) "Ambient Works 85–92" else "Paused"
+
+  public val mediaSub: String
+    get() = if (isLive) "no public API without extra tools" else "2:41 / 4:03"
+
+  /** The volume the MAC reports, not the one we guessed. Null when nothing has said. */
+  public val volumeValue: String
+    get() {
+      if (!isLive) return "$volume%"
+      val a = agentAudio ?: return "n/a"
+      return if (a.muted) "muted" else "${a.volumePercent}%"
+    }
+
+  public val volumeFraction: Float?
+    get() = if (!isLive) volume / 100f else agentAudio?.let { it.volumePercent / 100f }
+
+  /**
+   * Brightness has no read source at all.
+   *
+   * There is no `pmset`-style display brightness the agent could read on an external or built-in
+   * panel without extra tooling, so the keys stay -- they work over HID -- and the number goes
+   * away, because the local guess was drifting further from the real value with every press.
+   */
+  public val brightnessValue: String
+    get() = if (isLive) "n/a" else "$brightness%"
+
+  public val brightnessFraction: Float?
+    get() = if (isLive) null else brightness / 100f
+
+  /**
+   * A list's absence, as a headline and the tool's own words.
+   *
+   * The title comes from [headline], which is given the reason: Docker's socket error has a
+   * recognisable shape worth naming, most tools' do not. The raw reason goes underneath, clipped to
+   * one line -- nothing is hidden, it is just no longer the headline.
+   */
+  private fun <T> liveNotice(
+      list: AgentList<T>?,
+      tool: String,
+      headline: (String) -> String,
+  ): Notice? =
+      when {
+        !isLive -> null
+        list == null -> Notice("Asking $tool…", "")
+        !list.available -> {
+          val reason = list.reason.ifBlank { "$tool said nothing about why" }
+          Notice(headline(reason), Format.clip(reason))
+        }
+        else -> null
+      }
+
+  /** User macros come first, so a just-saved one is where the author left it. */
+  public val macros: List<Macro>
+    get() = userMacros + MockHost.builtInMacros
+
+  public val widgets: List<Widget>
+    get() =
+        (agentMetrics?.let(::liveWidgets) ?: simulatedWidgets).filterNot { it.id in hiddenWidgets }
+
+  /**
+   * Widgets from a real reading.
+   *
+   * Every figure the agent marks unavailable is labelled so on the widget rather than left as a
+   * plausible-looking zero: there is no SoC temperature and no fan speed without root, so the
+   * thermal tile shows throttling state and the battery's own sensor instead.
+   */
+  private fun liveWidgets(m: AgentMetrics): List<Widget> {
+    val h = agentHost
+    val pressure = (100 - m.memoryFreePercent).coerceIn(0, 100)
+    val cpuValue = if (m.cpuReady) "${m.cpuBusyPercent.roundToInt()}%" else "…"
+    val cpuSub =
+        when {
+          !m.cpuReady -> "sampling…"
+          h != null -> "${h.chip} · ${h.cores} cores"
+          else -> "load ${"%.2f".format(m.load1)}"
+        }
+    val thermalValue = if (m.throttled) "${m.cpuSpeedLimitPercent}%" else "ok"
+    val thermalSub = Derive.batteryTemperatureLabel(m.batteryTemperatureC)
+    val batValue = if (m.batteryPresent) "${m.batteryPercent}%" else "n/a"
+    val batSub =
+        when {
+          !m.batteryPresent -> "no battery"
+          else -> Derive.batteryPowerLabel(m.onAc, m.charging, m.drawWatts, m.systemWatts)
+        }
+    return listOf(
+        Widget(
+            "cpu", "CPU", cpuValue, cpuSub, if (m.cpuReady) m.cpuBusyPercent.roundToInt() else 0),
+        Widget(
+            "mem",
+            "Memory pressure",
+            "$pressure%",
+            "${Format.memoryPair(m.memoryUsedBytes, m.memoryTotalBytes)} used",
+            pressure),
+        Widget(
+            id = "temp",
+            label = "Thermals",
+            value = thermalValue,
+            sub = thermalSub,
+            percent = if (m.throttled) 100 - m.cpuSpeedLimitPercent else 0,
+            warn = m.throttled,
+        ),
+        Widget(
+            "bat",
+            "Battery",
+            batValue,
+            batSub,
+            if (m.batteryPresent) m.batteryPercent else 0,
+            warn = m.batteryPresent && !m.onAc && m.batteryPercent < BATTERY_WARN_PERCENT,
+        ),
+    )
+  }
+
+  private val simulatedWidgets: List<Widget>
+    get() =
+        listOf(
+            Widget("cpu", "CPU", "${cpu.last()}%", "M4 Max · 16 cores", cpu.last()),
+            Widget("mem", "Memory pressure", "$MEMORY_PERCENT%", "26.4 / 64 GB", MEMORY_PERCENT),
+            Widget(
+                id = "temp",
+                label = "Thermals",
+                value = "$temperature°",
+                sub = "fans $fanRpm rpm",
+                percent = temperature,
+                warn = temperature > THERMAL_WARN_C,
+            ),
+            Widget("bat", "Battery", "$BATTERY_PERCENT%", "$powerDraw W · on AC", BATTERY_PERCENT),
+        )
+
+  /**
+   * What is actually running, when the Mac can say.
+   *
+   * Every row here is derived from an endpoint, and a row whose endpoint said `available:false`
+   * carries that reason as its subtitle instead of a count. Antigravity has no source on this
+   * machine at all, so in live mode it is absent rather than green -- an item nobody is measuring
+   * should not be sitting in a list called "Running now".
+   */
+  public val runningNow: List<RunningItem>
+    get() {
+      if (!isLive) return MockHost.runningNow
+      val rows = mutableListOf<RunningItem>()
+      agentClaudeSessions?.let { sessions ->
+        val real = claudeRealPending
+        val waiting =
+            Derive.claudeWaitingCount(real, sessions.count { Derive.claudeWaiting(it.state) })
+        val idle = sessions.isEmpty()
+        rows +=
+            RunningItem(
+                moduleId = "claude",
+                title = "Claude Code",
+                // Prompts the phone can answer are the reason to look, so they
+                // take the line. Otherwise the dashboard's own sentence, from
+                // the same function, so the two screens cannot disagree about
+                // one Mac.
+                subtitle =
+                    if (real != null && real > 0) Derive.claudeWaitingLine(real)
+                    else
+                        Derive.claudeSummary(
+                            sessions.size, waiting, agentSessions?.runningProcesses),
+                tone =
+                    when {
+                      waiting > 0 -> StatusTone.Warn
+                      idle -> StatusTone.Neutral
+                      else -> StatusTone.Run
+                    },
+                tag =
+                    when {
+                      real != null && real > 0 -> Derive.claudeWaitingTag(real)
+                      waiting > 0 -> "waiting"
+                      idle -> "idle"
+                      else -> "running"
+                    },
+                tagTone =
+                    when {
+                      waiting > 0 -> TagTone.Warn
+                      idle -> TagTone.Neutral
+                      else -> TagTone.Accent
+                    },
+            )
+      }
+      agentPrs?.let { list ->
+        val states =
+            list.items.map {
+              Derive.prCheck(it.isDraft, it.checksSuccess, it.checksFailure, it.checksPending)
+            }
+        val green = states.count { it == Derive.PrCheck.Green }
+        val red = states.count { it == Derive.PrCheck.Red }
+        rows +=
+            RunningItem(
+                moduleId = "prs",
+                title = "Pull requests",
+                subtitle =
+                    if (list.available) "${list.items.size} open · $green green · $red red"
+                    // gh missing, or logged out, in gh's own words.
+                    else Format.clip(list.reason.ifBlank { "gh said nothing about why" }),
+                tone =
+                    when {
+                      !list.available -> StatusTone.Neutral
+                      red > 0 -> StatusTone.Crit
+                      else -> StatusTone.Ok
+                    },
+                tag =
+                    when {
+                      !list.available -> "no source"
+                      red > 0 -> "$red red"
+                      else -> "${list.items.size} open"
+                    },
+                tagTone =
+                    when {
+                      !list.available -> TagTone.Outline
+                      red > 0 -> TagTone.Sanguine
+                      else -> TagTone.Ok
+                    },
+            )
+      }
+      agentAntigravity?.let { ag ->
+        rows +=
+            RunningItem(
+                moduleId = "antigravity",
+                title = "Antigravity",
+                subtitle =
+                    if (ag.available) "v${ag.version} · ${ag.models.size} models" else ag.reason,
+                tone = if (ag.available) StatusTone.Ok else StatusTone.Neutral,
+                tag = if (ag.available) "ready" else "no source",
+                tagTone = if (ag.available) TagTone.Ok else TagTone.Outline,
+            )
+      }
+      agentOllama?.let { o ->
+        val loaded = o.running.size
+        rows +=
+            RunningItem(
+                moduleId = "ollama",
+                title = "Ollama",
+                subtitle =
+                    if (o.available) "${o.models.size} models · $loaded loaded" else o.reason,
+                tone = if (!o.available) StatusTone.Neutral else StatusTone.Ok,
+                tag =
+                    when {
+                      !o.available -> "no source"
+                      loaded > 0 -> "$loaded loaded"
+                      else -> "idle"
+                    },
+                tagTone =
+                    when {
+                      !o.available -> TagTone.Outline
+                      loaded > 0 -> TagTone.Ok
+                      else -> TagTone.Neutral
+                    },
+            )
+      }
+      agentVms?.let { v ->
+        val running = v.items.count { it.status.equals("Running", ignoreCase = true) }
+        val stopped = v.items.size - running
+        rows +=
+            RunningItem(
+                moduleId = "lima",
+                title = "Lima VMs",
+                subtitle = if (v.available) "$running running · $stopped stopped" else v.reason,
+                tone =
+                    when {
+                      !v.available -> StatusTone.Neutral
+                      stopped > 0 -> StatusTone.Warn
+                      else -> StatusTone.Ok
+                    },
+                tag =
+                    when {
+                      !v.available -> "no source"
+                      stopped > 0 -> "$stopped down"
+                      else -> "ready"
+                    },
+                tagTone =
+                    when {
+                      !v.available -> TagTone.Outline
+                      stopped > 0 -> TagTone.Warn
+                      else -> TagTone.Ok
+                    },
+            )
+      }
+      agentK8s?.let { k ->
+        val ready = k.items.count { it.ready }
+        val outOfSync =
+            agentArgo?.takeIf { it.available }?.items?.count { !Derive.argoOk(it.sync, it.health) }
+        rows +=
+            RunningItem(
+                moduleId = "homelab",
+                title = "Homelab · K3s",
+                subtitle =
+                    if (k.available)
+                        Format.parts(
+                            "$ready/${k.items.size} nodes ready",
+                            k.detail.ifBlank { null },
+                            // ArgoCD as a clause on the row that already
+                            // exists rather than a second cluster row: it is
+                            // the same cluster, and two rows for it would
+                            // read as two of them.
+                            when {
+                              outOfSync == null -> null
+                              outOfSync > 0 -> "$outOfSync out of sync"
+                              else ->
+                                  "${agentArgo?.items?.size ?: 0} app" +
+                                      "${plural(agentArgo?.items?.size ?: 0)} synced"
+                            },
+                        )
+                    else k.reason,
+                tone =
+                    when {
+                      !k.available -> StatusTone.Neutral
+                      (outOfSync ?: 0) > 0 -> StatusTone.Warn
+                      ready == k.items.size && ready > 0 -> StatusTone.Ok
+                      else -> StatusTone.Warn
+                    },
+                tag =
+                    when {
+                      !k.available -> "no source"
+                      (outOfSync ?: 0) > 0 -> "$outOfSync drifted"
+                      else -> "$ready/${k.items.size}"
+                    },
+                tagTone =
+                    when {
+                      !k.available -> TagTone.Outline
+                      (outOfSync ?: 0) > 0 -> TagTone.Warn
+                      ready == k.items.size && ready > 0 -> TagTone.Ok
+                      else -> TagTone.Warn
+                    },
+            )
+      }
+      agentContainers?.let { c ->
+        rows +=
+            RunningItem(
+                moduleId = "docker",
+                title =
+                    if (c.available)
+                        c.detail.ifBlank { "Containers" }.replaceFirstChar { it.uppercase() }
+                    else Format.containerTitle(c.reason),
+                subtitle =
+                    if (c.available) "${c.items.size} container${plural(c.items.size)}"
+                    // The runtime's own sentence, cut to one line: the full
+                    // Docker socket error is three times the width of a row.
+                    else Format.clip(c.reason),
+                tone = if (c.available) StatusTone.Ok else StatusTone.Neutral,
+                tag = if (c.available) "${c.items.size}" else "no source",
+                tagTone = if (c.available) TagTone.Ok else TagTone.Outline,
+            )
+      }
+      agentHomeSpeaker?.let { hs ->
+        val health = speakerHealth(hs)
+        rows +=
+            RunningItem(
+                moduleId = "homespeaker",
+                title = "HomeSpeaker",
+                // Where it will speak is the thing to know at a glance; the
+                // reason replaces it when there is nothing to speak through.
+                subtitle =
+                    if (hs.available)
+                        if (speakerSilent(hs)) Derive.NO_OUTPUTS
+                        else
+                            Format.parts(
+                                speakerOutputs(hs),
+                                // Speech length lives on the dashboard: with it, this
+                                // line ran past one row and cut "quiet hours" off.
+                                if (hs.pauseMedia) "pauses media" else null,
+                                if (hs.quietHoursEnabled) "quiet hours" else null,
+                            )
+                    else Format.clip(hs.reason),
+                tone =
+                    when (health) {
+                      Derive.SpeakerHealth.Ok -> StatusTone.Ok
+                      Derive.SpeakerHealth.Off -> StatusTone.Neutral
+                      Derive.SpeakerHealth.Problem -> StatusTone.Warn
+                    },
+                tag = speakerStatus(hs),
+                tagTone = if (health == Derive.SpeakerHealth.Ok) TagTone.Ok else TagTone.Outline,
+            )
+      }
+      return rows
+    }
+
+  public val moduleDashboards: Map<String, ModuleDashboard>
+    get() {
+      // MockHost has no pull-request mock and should not grow one: the module
+      // is about YOUR open PRs, and invented ones would be indistinguishable
+      // from real ones on the same plate.
+      val mocked =
+          MockHost.dashboards(agentTranscript.toList(), !agentPaused) +
+              ("prs" to simulatedPrsDashboard()) +
+              ("homespeaker" to simulatedHomeSpeakerDashboard()) +
+              ("tv" to simulatedTvDashboard())
+      if (!isLive) return mocked
+      // Every installed module gets a dashboard in live mode, including the
+      // ones nothing on this Mac feeds. Dropping those would leave the chip
+      // row looking arbitrary; showing the mock would be a fabrication. They
+      // get an honest empty one instead.
+      val ids = MockHost.gallery.map { it.id }
+      return ids.associateWith { id -> liveDashboard(id) ?: unwiredDashboard(id) }
+    }
+
+  /** The modules that have a real source on this machine. */
+  private fun liveDashboard(id: String): ModuleDashboard? =
+      when (id) {
+        "claude" -> claudeDashboard()
+        "prs" -> prsDashboard()
+        "lima" -> limaDashboard()
+        "homelab" -> homelabDashboard()
+        "docker" -> dockerDashboard()
+        "ollama" -> ollamaDashboard()
+        "homespeaker" -> homeSpeakerDashboard()
+        "tv" -> tvDashboard()
+        "antigravity" -> antigravityDashboard()
+        "grafana" -> grafanaDashboard()
+        else -> null
+      }
+
+  /** The sessions the agent inferred, newest state first-hand rather than the phone's guess. */
+  private fun claudeDashboard(): ModuleDashboard {
+    val sessions = agentClaudeSessions.orEmpty()
+    val processes = agentSessions?.runningProcesses ?: 0
+    val real = claudeRealPending
+    val waiting = Derive.claudeWaitingCount(real, sessions.count { Derive.claudeWaiting(it.state) })
+    val selected = selectedSession
+    return ModuleDashboard(
+        id = "claude",
+        name = "Claude Code",
+        // The same sentence Home's "Running now" row prints.
+        meta =
+            Format.parts(
+                Derive.claudeSummary(sessions.size, waiting, agentSessions?.runningProcesses),
+                shortHostName().ifBlank { null },
+            ),
+        status =
+            when {
+              waiting > 0 -> "$waiting waiting"
+              processes > 0 -> "running"
+              else -> "idle"
+            },
+        statusTone =
+            when {
+              waiting > 0 -> StatusTone.Warn
+              processes > 0 -> StatusTone.Run
+              else -> StatusTone.Neutral
+            },
+        metrics =
+            listOf(
+                ModuleMetric("Sessions", "${sessions.size}", "recent transcripts"),
+                // The tile that earns the module: a session blocked on a
+                // permission prompt is one nobody is watching, and it is the
+                // only number here that asks the user to do something.
+                // Measured when the agent can say (the prompts it holds for
+                // this phone); the transcript guess otherwise, and labelled so.
+                ModuleMetric(
+                    "Waiting",
+                    "$waiting",
+                    if (real == null) "guessed from transcripts" else "for you, here"),
+                ModuleMetric(
+                    "Processes",
+                    agentSessions?.let { "${it.runningProcesses}" } ?: "…",
+                    "live claude binaries"),
+            ),
+        streamLabel =
+            if (selected != null) "Session · ${sessionName(selected)}"
+            else "Transcript · this phone",
+        lines = transcriptLines(selected),
+        cursor = !agentPaused,
+        prompts = true,
+        markdown = true,
+        listLabel = "Sessions",
+        rows = sessions.map(::claudeSessionRow),
+    )
+  }
+
+  /** The selected session, or null when nothing is selected or the selection has gone away. */
+  private val selectedSession: AgentClaudeSession?
+    get() = agentClaudeSessions?.firstOrNull { it.sessionId == selectedSessionId }
+
+  /**
+   * What the stream pane shows.
+   *
+   * With a session selected: what that session last said, from the Mac, above this phone's own
+   * exchanges with it. The two are labelled separately because they came from different places --
+   * the first is the transcript on the Mac, the rest is what was typed here.
+   */
+  private fun transcriptLines(session: AgentClaudeSession?): List<TerminalLine> {
+    if (session == null) return agentTranscript.toList()
+    val head = mutableListOf<TerminalLine>()
+    head += TerminalLine(" ", "last from ${sessionName(session)}", TerminalTone.Dim)
+    when {
+      session.lastText.isNotBlank() ->
+          head += TerminalLine("‹", session.lastText, TerminalTone.Text)
+      session.lastTool.isNotBlank() ->
+          head += TerminalLine("‹", "tool · ${session.lastTool}", TerminalTone.Dim)
+      else -> head += TerminalLine("‹", "nothing parseable in the last records", TerminalTone.Dim)
+    }
+    return head + agentTranscript.toList()
+  }
+
+  /**
+   * One Claude Code session as a row.
+   *
+   * The home directory is INFERRED rather than assumed: the agent's session path runs through
+   * `~/.claude/projects`, so everything before that is the home directory on the machine that
+   * answered -- no `/Users/<name>` guess, which is wrong the moment the Mac has two accounts.
+   */
+  private fun claudeSessionRow(session: AgentClaudeSession): ModuleRow {
+    val look = Derive.sessionLook(session.state)
+    return ModuleRow(
+        title = sessionName(session),
+        // What it is doing, in its own words. A path here would repeat the
+        // title; the last thing it said is the only thing that distinguishes
+        // two sessions in the same repository.
+        subtitle =
+            when {
+              // Markers stripped: a one-line row cannot draw bold, and
+              // "**Gist**" as literal text was the first thing on it.
+              session.lastText.isNotBlank() -> Format.clip(Markdown.plain(session.lastText))
+              session.lastTool.isNotBlank() -> "tool · ${session.lastTool}"
+              else -> session.cwd.ifBlank { session.project }
+            },
+        // The raw timestamp survives only when it cannot be read as a time;
+        // an unparseable date shown as "just now" would be an invention.
+        trailing =
+            Format.relativeTime(session.lastActive, System.currentTimeMillis()).ifBlank {
+              session.lastActive
+            },
+        tone = lookTone(look),
+        tag = Derive.claudeStateLabel(session.state),
+        tagTone = lookTagTone(look),
+        selected = session.sessionId == selectedSessionId,
+        onSelect = { selectSession(session.sessionId) },
+    )
+  }
+
+  /** A session row's dot, the same for Claude and Antigravity. */
+  private fun lookTone(look: Derive.SessionLook): StatusTone =
+      when (look) {
+        Derive.SessionLook.Waiting -> StatusTone.Warn
+        Derive.SessionLook.Working -> StatusTone.Run
+        Derive.SessionLook.Idle -> StatusTone.Ok
+        Derive.SessionLook.Other -> StatusTone.Neutral
+      }
+
+  /** A session row's tag colour: amber only for the state that needs a person. */
+  private fun lookTagTone(look: Derive.SessionLook): TagTone =
+      when (look) {
+        Derive.SessionLook.Waiting -> TagTone.Warn
+        Derive.SessionLook.Working -> TagTone.Accent
+        Derive.SessionLook.Idle -> TagTone.Neutral
+        Derive.SessionLook.Other -> TagTone.Outline
+      }
+
+  /** The project's own name -- the last segment of its path -- not the whole path. */
+  private fun sessionName(session: AgentClaudeSession): String {
+    val source = session.cwd.ifBlank { session.project }
+    val home = Format.homeFor(session.path) ?: Format.homeFor(source)
+    return Format.shortPath(source, home).name.ifBlank { session.project.ifBlank { "session" } }
+  }
+
+  /**
+   * Open pull requests, as the Mac's own `gh` sees them.
+   *
+   * The counts are of PRs, not of checks: "3 green" means three pull requests whose every finished
+   * check passed, which is the question being asked. Summing check counts across PRs would give a
+   * number in the hundreds that answers nothing.
+   */
+  private fun prsDashboard(): ModuleDashboard {
+    val list = agentPrs
+    val available = list?.available == true
+    val prs = list?.items.orEmpty()
+    val states =
+        prs.map { Derive.prCheck(it.isDraft, it.checksSuccess, it.checksFailure, it.checksPending) }
+    val green = states.count { it == Derive.PrCheck.Green }
+    val red = states.count { it == Derive.PrCheck.Red }
+    val pending = states.count { it == Derive.PrCheck.Pending }
+    return ModuleDashboard(
+        id = "prs",
+        name = "Pull requests",
+        meta = "gh search prs --author @me --state open",
+        status =
+            when {
+              !available -> "no source"
+              red > 0 -> "$red failing"
+              else -> "${prs.size} open"
+            },
+        statusTone =
+            when {
+              !available -> StatusTone.Neutral
+              red > 0 -> StatusTone.Crit
+              else -> StatusTone.Ok
+            },
+        metrics =
+            listOf(
+                ModuleMetric("Open", if (available) "${prs.size}" else "n/a", "yours, plus extras"),
+                ModuleMetric("Green", if (available) "$green" else "n/a", "all checks passed"),
+                ModuleMetric("Red", if (available) "$red" else "n/a", "a check failed"),
+                ModuleMetric("Waiting", if (available) "$pending" else "n/a", "checks running"),
+            ),
+        streamLabel = "gh",
+        lines =
+            summaryLines("gh search prs --author @me --state open", list) {
+              "${it.repo}#${it.number}  ${Format.clip(it.title)}"
+            },
+        cursor = false,
+        prompts = false,
+        listLabel = "Open pull requests",
+        rows = prs.mapIndexed { index, pr -> prRow(pr, states[index]) },
+    )
+  }
+
+  private fun prRow(pr: AgentPr, check: Derive.PrCheck): ModuleRow =
+      ModuleRow(
+          title = Derive.prTitle(pr.repo, pr.number, pr.title),
+          titleLines = 2,
+          subtitle =
+              Format.parts(
+                  pr.author.ifBlank { null },
+                  "${pr.headRef} → ${pr.baseRef}",
+                  Format.relativeTime(pr.updatedAt, System.currentTimeMillis()).ifBlank {
+                    pr.updatedAt.ifBlank { null }
+                  },
+              ),
+          // The merge state, not a second copy of the check state: `BLOCKED`
+          // with every check green is the case worth seeing, and it is
+          // GitHub's own word for it.
+          trailing = pr.mergeState.lowercase(Locale.ROOT).ifBlank { "—" },
+          tone =
+              when (check) {
+                Derive.PrCheck.Red -> StatusTone.Crit
+                Derive.PrCheck.Green -> StatusTone.Ok
+                Derive.PrCheck.Pending -> StatusTone.Run
+                else -> StatusTone.Neutral
+              },
+          tag = check.label,
+          tagTone =
+              when (check) {
+                Derive.PrCheck.Red -> TagTone.Sanguine
+                Derive.PrCheck.Green -> TagTone.Ok
+                Derive.PrCheck.Pending -> TagTone.Accent
+                else -> TagTone.Outline
+              },
+          // Hidden until the row is tapped: see [expandedPr].
+          actions = if (expandedPr == prKey(pr)) prActions(pr) else emptyList(),
+          selected = expandedPr == prKey(pr),
+          onSelect = { togglePr(pr) },
+      )
+
+  private fun prKey(pr: AgentPr): String = "${pr.repo}#${pr.number}"
+
+  /** Shows one PR's buttons, or hides them when it was the one showing. */
+  public fun togglePr(pr: AgentPr) {
+    val key = prKey(pr)
+    expandedPr = if (expandedPr == key) null else key
+  }
+
+  /**
+   * What can be done to a pull request from a phone.
+   *
+   * Merge is the one that goes through the confirmation dialog: everything else here is reversible
+   * from the GitHub UI in a tap, and a merge is not. Ready is offered only on a draft, because `gh
+   * pr ready` on an already-ready PR is an error message rather than an action.
+   */
+  private fun prActions(pr: AgentPr): List<RowAction> = buildList {
+    add(RowAction("Approve", enabled = paired) { prAction(pr, "approve") })
+    add(
+        RowAction("Merge", enabled = paired, danger = true) {
+          openDialog(DialogKind.MergePr(pr.repo, pr.number, pr.title))
+        })
+    add(
+        RowAction(if (pr.autoMerge) "Auto-merge ✓" else "Auto-merge", enabled = paired) {
+          prAction(pr, "auto_merge")
+        })
+    if (pr.isDraft) add(RowAction("Ready", enabled = paired) { prAction(pr, "ready") })
+  }
+
+  /**
+   * The pull-request module in simulated mode.
+   *
+   * Two invented rows would be indistinguishable from two real ones, so there are none: the plate
+   * says what the module needs and that nothing here is measuring it.
+   */
+  private fun simulatedPrsDashboard(): ModuleDashboard =
+      ModuleDashboard(
+          id = "prs",
+          name = "Pull requests",
+          meta = "gh · on the Mac",
+          status = "simulated · no Mac",
+          statusTone = StatusTone.Neutral,
+          metrics =
+              listOf(
+                  ModuleMetric("Open", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Green", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Red", "n/a", "needs a paired Mac"),
+              ),
+          streamLabel = "gh",
+          lines =
+              listOf(
+                  TerminalLine("$", "gh search prs --author @me --state open", TerminalTone.Text),
+                  TerminalLine(" ", "no Mac is configured, so nothing ran", TerminalTone.Dim)),
+          cursor = false,
+          prompts = false,
+          listLabel = "Open pull requests",
+          rows =
+              listOf(
+                  ModuleRow(
+                      "Nothing to show without a Mac",
+                      "pair one and this lists your open PRs",
+                      "n/a",
+                      StatusTone.Neutral,
+                  )),
+      )
+
+  private fun limaDashboard(): ModuleDashboard {
+    val v = agentVms
+    val running = v?.items?.count { it.status.equals("Running", ignoreCase = true) } ?: 0
+    val available = v?.available == true
+    return ModuleDashboard(
+        id = "lima",
+        name = "Lima VMs",
+        meta = "limactl list",
+        status = if (available) "$running of ${v?.items?.size ?: 0} running" else "no source",
+        statusTone = if (available) StatusTone.Ok else StatusTone.Neutral,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Running", if (available) "$running" else "n/a", "of ${v?.items?.size ?: 0}"),
+                ModuleMetric(
+                    "vCPU",
+                    if (available) "${v?.items?.sumOf { it.cpus } ?: 0}" else "n/a",
+                    "allocated"),
+                ModuleMetric(
+                    "Memory",
+                    if (available) Format.formatBytes(v?.items?.sumOf { it.memoryBytes } ?: 0L)
+                    else "n/a",
+                    "allocated"),
+            ),
+        streamLabel = "limactl list",
+        lines = summaryLines("limactl list", v) { "${it.name}  ${it.status}  ${it.arch}" },
+        cursor = false,
+        prompts = false,
+        listLabel = "Instances",
+        rows =
+            v?.items?.map { vm ->
+              ModuleRow(
+                  vm.name,
+                  Format.parts(vm.arch, "${vm.cpus} cpu", Format.memoryBytes(vm.memoryBytes)),
+                  vm.status.lowercase(Locale.ROOT),
+                  if (vm.status.equals("Running", ignoreCase = true)) StatusTone.Ok
+                  else StatusTone.Warn,
+              )
+            } ?: emptyList(),
+    )
+  }
+
+  private fun homelabDashboard(): ModuleDashboard {
+    val k = agentK8s
+    val ready = k?.items?.count { it.ready } ?: 0
+    val total = k?.items?.size ?: 0
+    val available = k?.available == true
+    val argo = agentArgo
+    val argoAvailable = argo?.available == true
+    val apps = argo?.items.orEmpty()
+    val synced = apps.count { it.sync.equals("Synced", ignoreCase = true) }
+    val healthy = apps.count { it.health.equals("Healthy", ignoreCase = true) }
+    return ModuleDashboard(
+        id = "homelab",
+        name = "Homelab · K3s",
+        meta = if (available) "kubectl · ${k?.detail}" else "kubectl",
+        status = if (available) "$ready/$total ready" else "no source",
+        statusTone =
+            when {
+              !available -> StatusTone.Neutral
+              ready == total && total > 0 -> StatusTone.Ok
+              else -> StatusTone.Warn
+            },
+        metrics =
+            listOf(
+                ModuleMetric("Nodes", if (available) "$ready/$total" else "n/a", "ready / total"),
+                ModuleMetric("Context", k?.detail?.ifBlank { "n/a" } ?: "n/a", "kubectl context"),
+                ModuleMetric("Apps", if (argoAvailable) "${apps.size}" else "n/a", "ArgoCD"),
+                ModuleMetric("Synced", if (argoAvailable) "$synced" else "n/a", "of ${apps.size}"),
+                ModuleMetric(
+                    "Healthy", if (argoAvailable) "$healthy" else "n/a", "of ${apps.size}"),
+            ),
+        streamLabel = "kubectl get nodes",
+        lines =
+            summaryLines("kubectl get nodes", k) {
+              "${it.name}  ${if (it.ready) "Ready" else "NotReady"}  ${it.version}"
+            },
+        cursor = false,
+        prompts = false,
+        listLabel = "Nodes · ArgoCD",
+        rows =
+            (k?.items?.map { node ->
+              ModuleRow(
+                  node.name,
+                  "${node.roles.joinToString(",").ifBlank { "no role" }} · ${node.version}",
+                  if (node.ready) "ready" else "not ready",
+                  if (node.ready) StatusTone.Ok else StatusTone.Crit,
+              )
+            } ?: emptyList()) + argoRows(),
+    )
+  }
+
+  /**
+   * The ArgoCD half of the homelab list.
+   *
+   * Broken first, and the healthy remainder as ONE row. Fifty applications in a phone-height list
+   * is a scroll nobody performs, and the three that are out of sync were in the middle of it. When
+   * kubectl cannot answer this is a single row carrying the cluster's own reason -- not an empty
+   * space, which reads as "no applications".
+   */
+  private fun argoRows(): List<ModuleRow> {
+    val argo = agentArgo ?: return emptyList()
+    if (!argo.available) {
+      return listOf(
+          ModuleRow(
+              title = "ArgoCD is not readable",
+              subtitle = Format.clip(argo.reason.ifBlank { "kubectl said nothing about why" }),
+              trailing = "n/a",
+              tone = StatusTone.Neutral,
+          ))
+    }
+    if (argo.items.isEmpty()) {
+      return listOf(
+          ModuleRow("No ArgoCD applications", "kubectl returned none", "0", StatusTone.Neutral))
+    }
+    val split = Derive.splitArgo(argo.items) { Derive.argoOk(it.sync, it.health) }
+    val rows =
+        split.attention.map { app ->
+          ModuleRow(
+              title = app.name,
+              subtitle =
+                  Format.parts(
+                      "${app.sync.lowercase(Locale.ROOT)} · ${app.health.lowercase(Locale.ROOT)}",
+                      app.namespace,
+                      app.revision.ifBlank { null },
+                      app.message.ifBlank { null }?.let(Format::clip),
+                  ),
+              trailing = app.revision.ifBlank { "—" },
+              tone =
+                  if (app.health.equals("Degraded", ignoreCase = true)) StatusTone.Crit
+                  else StatusTone.Warn,
+              tag = app.sync.lowercase(Locale.ROOT),
+              tagTone = TagTone.Warn,
+              actions =
+                  listOf(
+                      RowAction(
+                          label = "Sync",
+                          enabled = paired,
+                          onClick = { openDialog(DialogKind.SyncApp(app.name, app.namespace)) },
+                      )),
+          )
+        }
+    if (split.restCount == 0) return rows
+    return rows +
+        ModuleRow(
+            title = Derive.collapsedArgoLabel(split.restCount),
+            subtitle = "nothing to do on these",
+            trailing = "${split.restCount}",
+            tone = StatusTone.Ok,
+        )
+  }
+
+  /**
+   * Why a module cannot mean anything on this Mac, or null if it can. Only answered while live and
+   * only once the agent has said which tools exist; before that the gallery stays quiet rather than
+   * guessing.
+   */
+  public fun moduleUnavailableReason(id: String): String? {
+    val entry = MockHost.gallery.firstOrNull { it.id == id } ?: return null
+    val needs = entry.requires ?: return null
+    val tools = agentTools ?: return null
+    if (agentUrl.isBlank()) return null
+    val tool = tools.tools[needs] ?: return null
+    return if (tool.available) null else "$needs is not on this Mac"
+  }
+
+  // --- HomeSpeaker ---------------------------------------------------------
+
+  /**
+   * The Mac's speaker, from the agent's reading of HomeSpeaker's own config file.
+   *
+   * The controls are rows, not a new widget: the same list the Hosts screen and the PR module use,
+   * with the selected speaker carrying the accent rule and the switches as row buttons. One
+   * selection idiom and one button idiom in the app, not three.
+   */
+  private fun homeSpeakerDashboard(): ModuleDashboard {
+    val hs = agentHomeSpeaker
+    val available = hs?.available == true
+    val busy = homeSpeakerBusy
+    val status =
+        when {
+          busy != null -> "Working · $busy…"
+          hs == null -> "asking…"
+          else -> speakerStatus(hs)
+        }
+    val tone =
+        when {
+          busy != null -> StatusTone.Warn
+          hs == null -> StatusTone.Neutral
+          else ->
+              when (speakerHealth(hs)) {
+                Derive.SpeakerHealth.Ok -> StatusTone.Ok
+                Derive.SpeakerHealth.Off -> StatusTone.Neutral
+                Derive.SpeakerHealth.Problem -> StatusTone.Warn
+              }
+        }
+    // Where it will speak, under the name -- only from an agent that knows
+    // (v1.8); an older one keeps the old line rather than a guess.
+    val outputsKnown = available && hs!!.speakHome != null && hs.speakLocal != null
+    val selected = hs?.targets?.firstOrNull { it.selected }
+    val head = TerminalLine("$", "HomeSpeaker · last spoken", TerminalTone.Text)
+    val lines = buildList {
+      add(head)
+      homeSpeakerNotice?.let { (msg, nTone) ->
+        val lineTone =
+            when (nTone) {
+              StatusTone.Ok -> TerminalTone.Ok
+              StatusTone.Warn -> TerminalTone.Warn
+              StatusTone.Crit -> TerminalTone.Err
+              else -> TerminalTone.Dim
+            }
+        add(TerminalLine("!", msg, lineTone))
+      }
+      when {
+        hs == null -> add(TerminalLine(" ", "asking…", TerminalTone.Dim))
+        !hs.available -> add(TerminalLine(" ", hs.reason, TerminalTone.Warn))
+        hs.last == null -> add(TerminalLine(" ", "nothing spoken yet", TerminalTone.Dim))
+        else -> {
+          add(
+              TerminalLine(
+                  " ",
+                  "${hs.last.target} · ${hs.last.source} · " +
+                      Format.relativeTime(hs.last.at, System.currentTimeMillis()).ifBlank {
+                        hs.last.at
+                      },
+                  TerminalTone.Dim))
+          add(TerminalLine("›", hs.last.text, TerminalTone.Ok))
+        }
+      }
+    }
+    return ModuleDashboard(
+        id = "homespeaker",
+        name = "HomeSpeaker",
+        meta =
+            when {
+              outputsKnown -> speakerOutputs(hs!!)
+              hs?.structureName.isNullOrBlank() -> "~/.gemini/speaker_broadcast.json"
+              else -> hs!!.structureName
+            },
+        metaWarn = outputsKnown && speakerSilent(hs!!),
+        status = status,
+        statusTone = tone,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Speaker",
+                    selected?.name ?: if (available) "none" else "n/a",
+                    selected?.room ?: "pick one below"),
+                agentSpeakerVolume.let { v ->
+                  ModuleMetric(
+                      "Volume",
+                      when {
+                        speakerVolumeBusy -> "…"
+                        v == null -> if (available) "asking…" else "n/a"
+                        else -> Derive.speakerVolumeLabel(v.available, v.online, v.muted, v.percent)
+                      },
+                      if (v != null && !v.available) Format.clip(v.reason, 40)
+                      else "of the speaker")
+                },
+                ModuleMetric(
+                    "Says",
+                    if (available) Derive.speechLengthLabel(hs!!.speechLength) else "n/a",
+                    "of each reply"),
+                ModuleMetric(
+                    "Quiet hours",
+                    when {
+                      !available -> "n/a"
+                      hs!!.quietHoursEnabled -> "${hs.quietHoursStart}–${hs.quietHoursEnd}"
+                      else -> "off"
+                    },
+                    if (available && hs!!.quietHoursEnabled) "no automatic speech"
+                    else "always speaks"),
+            ),
+        streamLabel = "Last announcement",
+        lines = lines,
+        cursor = false,
+        prompts = false,
+        listLabel = "Controls and speakers",
+        rows = if (hs == null || !hs.available) emptyList() else homeSpeakerRows(hs),
+        extraLists = if (hs == null || !hs.available) emptyList() else homeSpeakerExtraLists(hs),
+        composer =
+            ModuleComposer(
+                placeholder = "Announce on ${selected?.name ?: "the speaker"}…",
+                buttonLabel = "Say it",
+                value = announceDraft,
+                enabled = paired && available && announceDraft.isNotBlank(),
+                onValueChange = ::updateAnnounceDraft,
+                onSubmit = ::announce,
+            ),
+    )
+  }
+
+  private fun homeSpeakerRows(hs: AgentHomeSpeaker): List<ModuleRow> = buildList {
+    // Broadcasting off: nothing else on this plate changes what is heard, so
+    // the master switch is the whole plate.
+    if (!hs.enabled) {
+      add(
+          ModuleRow(
+              title = "Broadcasting",
+              subtitle = "replies stay silent · automatic broadcasts are off",
+              trailing = "off",
+              tone = StatusTone.Neutral,
+              toggle =
+                  RowToggle(checked = false, enabled = paired) {
+                    setHomeSpeaker("broadcasting on", enabled = true)
+                  },
+          ))
+      return@buildList
+    }
+    add(
+        ModuleRow(
+            title = "Broadcasting",
+            subtitle = "replies are read aloud",
+            trailing = "on",
+            tone = StatusTone.Ok,
+            toggle =
+                RowToggle(checked = true, enabled = paired) {
+                  setHomeSpeaker("broadcasting off", enabled = false)
+                },
+        ))
+    val homeRelevant = Derive.homeSettingsRelevant(hs.speakHome)
+    val geminiVoiceName = Derive.geminiVoiceDisplayName(hs.geminiVoice, hs.customVoices)
+    // Which speaker: one dropdown rather than a row per speaker.
+    fun addSpeakerRow() {
+      if (hs.targets.isEmpty()) {
+        add(
+            ModuleRow(
+                "No speakers found yet",
+                "open HomeSpeaker on the Mac and run Find speakers",
+                "0",
+                StatusTone.Warn))
+        return
+      }
+      val current = hs.targets.firstOrNull { it.selected }
+      add(
+          ModuleRow(
+              title = "Speaker",
+              subtitle =
+                  current?.let {
+                    if (it.type == "Structure") "every speaker at once"
+                    else "${it.room} · ${it.type}"
+                  } ?: "no speaker picked",
+              trailing = current?.name ?: "None",
+              tone = if (current != null) StatusTone.Ok else StatusTone.Neutral,
+              actions =
+                  if (current != null)
+                      listOf(
+                          RowAction("Remove", enabled = paired) {
+                            setHomeSpeaker(
+                                "remove speaker ${current.name}", removeTarget = current.key)
+                          })
+                  else emptyList(),
+              choices =
+                  hs.targets.map { t ->
+                    RowAction(
+                        Derive.speakerChoiceLabel(t.name, t.room, t.type),
+                        enabled = paired && !t.selected,
+                        selected = t.selected) {
+                          setHomeSpeaker("speaker ${t.name}", defaultTarget = t.key)
+                        }
+                  },
+          ))
+    }
+    // The outputs, from an agent that can switch them (v1.8+); an older
+    // one gets no switches rather than ones that would be refused. All off
+    // is kept -- the user asked for it -- and the rows turn amber to say
+    // nothing will be spoken.
+    val speakHome = hs.speakHome
+    val speakLocal = hs.speakLocal
+    if (speakHome != null && speakLocal != null) {
+      val silent = !speakHome && !speakLocal && hs.speakPhone != true
+      add(
+          ModuleRow(
+              title = "Home speakers",
+              subtitle =
+                  if (speakHome) "announcements play on Google Home" else "Google Home stays quiet",
+              trailing = if (speakHome) "on" else "off",
+              tone =
+                  when {
+                    silent -> StatusTone.Warn
+                    speakHome -> StatusTone.Ok
+                    else -> StatusTone.Neutral
+                  },
+              toggle =
+                  RowToggle(checked = speakHome, enabled = paired) { next ->
+                    setHomeSpeaker("home speakers ${if (next) "on" else "off"}", speakHome = next)
+                  },
+          ))
+      if (speakHome) {
+        add(
+            ModuleRow(
+                title = "Google Home account",
+                subtitle =
+                    if (hs.accountEmail.isNotBlank()) hs.accountEmail
+                    else if (hs.signedIn) "signed in" else "not signed in",
+                trailing = if (hs.signedIn) "signed in" else "sign in",
+                tone = if (hs.signedIn) StatusTone.Ok else StatusTone.Neutral,
+                actions =
+                    buildList {
+                      if (hs.signedIn) {
+                        add(
+                            RowAction("Sign out", enabled = paired) {
+                              setHomeSpeaker("sign out", signOut = true)
+                            })
+                      }
+                      if (!hs.signedIn && hs.hasAntigravityTokens) {
+                        add(
+                            RowAction("Import login", enabled = paired) {
+                              setHomeSpeaker("import antigravity", importAntigravity = true)
+                            })
+                      }
+                    },
+            ))
+        add(
+            ModuleRow(
+                title = "Find speakers",
+                subtitle =
+                    if (hs.targets.isEmpty()) "0 speakers discovered"
+                    else "${hs.targets.size} speakers discovered",
+                // The button says it; "discover" beside it only narrowed the title.
+                trailing = "",
+                actions =
+                    listOf(
+                        RowAction("Find speakers", enabled = paired) {
+                          setHomeSpeaker("discover", discover = true)
+                        }),
+            ))
+        if (hs.homes.isNotEmpty()) {
+          add(
+              ModuleRow(
+                  title = "Home structure",
+                  subtitle = "Google Home structure",
+                  trailing = hs.structureName.ifBlank { "Home" },
+                  choices =
+                      hs.homes.map { h ->
+                        val current = h.id == hs.structureId
+                        RowAction(h.name, enabled = paired && !current, selected = current) {
+                          setHomeSpeaker("home ${h.name}", structureId = h.id)
+                        }
+                      },
+              ))
+        }
+        addSpeakerRow()
+      }
+      if (Derive.castVoiceRelevant(speakHome, hs.localEngine)) {
+        add(
+            ModuleRow(
+                title = "Cast selected voice",
+                subtitle =
+                    if (hs.homeCastVoice) "streams Gemini voice to Google Home"
+                    else "Google Home speaks with its own cloud voice",
+                trailing = if (hs.homeCastVoice) "on" else "off",
+                tone = if (hs.homeCastVoice) StatusTone.Ok else StatusTone.Neutral,
+                toggle =
+                    RowToggle(checked = hs.homeCastVoice, enabled = paired) { next ->
+                      setHomeSpeaker(
+                          "cast selected voice ${if (next) "on" else "off"}", homeCastVoice = next)
+                    },
+            ))
+      }
+      add(
+          ModuleRow(
+              title = Derive.THIS_MAC,
+              // The Apple voice is chosen on the Mac; Gemini TTS voice can be switched below.
+              subtitle =
+                  Derive.macVoiceLabel(
+                      hs.localVoiceName,
+                      hs.localVoice,
+                      hs.localEngine,
+                      geminiVoiceName,
+                      hs.hasGeminiKey),
+              trailing = if (speakLocal) "on" else "off",
+              tone =
+                  when {
+                    silent -> StatusTone.Warn
+                    speakLocal -> StatusTone.Ok
+                    else -> StatusTone.Neutral
+                  },
+              toggle =
+                  RowToggle(checked = speakLocal, enabled = paired) { next ->
+                    setHomeSpeaker("this Mac ${if (next) "on" else "off"}", speakLocal = next)
+                  },
+          ))
+      if (speakLocal) {
+        add(
+            ModuleRow(
+                title = "Mac voice",
+                subtitle = hs.localVoiceName.ifBlank { "System default" },
+                trailing = hs.localVoiceName.ifBlank { "default" },
+                actions =
+                    listOf(
+                        RowAction("Preview", enabled = paired) {
+                          setHomeSpeaker("preview voice", previewVoice = true)
+                        }),
+                choices =
+                    if (hs.availableVoices.isEmpty()) emptyList()
+                    else
+                        hs.availableVoices.map { v ->
+                          val current = v.id == hs.localVoice
+                          RowAction(v.name, enabled = paired && !current, selected = current) {
+                            setHomeSpeaker("Mac voice ${v.name}", localVoice = v.id)
+                          }
+                        },
+            ))
+      }
+      val speakPhone = hs.speakPhone
+      if (speakPhone != null) {
+        val phoneConnected = hs.phoneConnected || bridgeLinked
+        add(
+            ModuleRow(
+                title = Derive.THIS_PHONE,
+                subtitle =
+                    Derive.phoneVoiceLabel(
+                        hs.localEngine,
+                        geminiVoiceName,
+                        hs.hasGeminiKey,
+                        phoneConnected,
+                        hs.phoneHeadphonesOnly),
+                trailing = if (speakPhone) "on" else "off",
+                tone =
+                    when {
+                      silent -> StatusTone.Warn
+                      speakPhone && !phoneConnected -> StatusTone.Warn
+                      speakPhone -> StatusTone.Ok
+                      else -> StatusTone.Neutral
+                    },
+                toggle =
+                    RowToggle(checked = speakPhone, enabled = paired) { next ->
+                      setHomeSpeaker("this phone ${if (next) "on" else "off"}", speakPhone = next)
+                    },
+            ))
+        if (speakPhone) {
+          add(
+              ModuleRow(
+                  title = "Phone · Pause media",
+                  subtitle =
+                      if (hs.phonePauseMedia) "pauses phone audio while speaking"
+                      else "phone media keeps playing",
+                  trailing = if (hs.phonePauseMedia) "on" else "off",
+                  tone = if (hs.phonePauseMedia) StatusTone.Ok else StatusTone.Neutral,
+                  toggle =
+                      RowToggle(checked = hs.phonePauseMedia, enabled = paired) { next ->
+                        setHomeSpeaker(
+                            "phone pause media ${if (next) "on" else "off"}",
+                            phonePauseMedia = next)
+                      },
+              ))
+          add(
+              ModuleRow(
+                  title = "Phone · Headphones only",
+                  subtitle =
+                      if (hs.phoneHeadphonesOnly) "only speaks into wired or Bluetooth headphones"
+                      else "speaks on phone speaker or headphones",
+                  trailing = if (hs.phoneHeadphonesOnly) "on" else "off",
+                  tone = if (hs.phoneHeadphonesOnly) StatusTone.Ok else StatusTone.Neutral,
+                  toggle =
+                      RowToggle(checked = hs.phoneHeadphonesOnly, enabled = paired) { next ->
+                        setHomeSpeaker(
+                            "phone headphones only ${if (next) "on" else "off"}",
+                            phoneHeadphonesOnly = next)
+                      },
+              ))
+        }
+      }
+      // The local engine and its voice only matter when something speaks with them.
+      if (Derive.localVoiceInUse(speakLocal, hs.speakPhone, speakHome, hs.homeCastVoice)) {
+        add(
+            ModuleRow(
+                title = "Local voice engine",
+                subtitle =
+                    if (hs.localEngine == "gemini" && !hs.hasGeminiKey)
+                        "needs Gemini API key on the Mac"
+                    else "how This Mac synthesizes speech",
+                trailing = Derive.localEngineLabel(hs.localEngine),
+                tone =
+                    if (hs.localEngine == "gemini" && !hs.hasGeminiKey) StatusTone.Warn
+                    else StatusTone.Neutral,
+                choices =
+                    Derive.localEngines.map { wire ->
+                      val current = wire == hs.localEngine
+                      RowAction(
+                          Derive.localEngineLabel(wire),
+                          enabled = paired && !current,
+                          selected = current) {
+                            setHomeSpeaker(
+                                "local engine ${Derive.localEngineLabel(wire)}", localEngine = wire)
+                          }
+                    },
+            ))
+        if (hs.localEngine == "gemini") {
+          val custom =
+              hs.geminiVoice == "voice_vaoo7ayczx69" ||
+                  hs.geminiVoice == "voice_o1be80ujj8bb" ||
+                  hs.customVoices.any { it.id == hs.geminiVoice }
+          add(
+              ModuleRow(
+                  title = "Gemini voice",
+                  subtitle = if (custom) "cloned voice" else "prebuilt Gemini TTS voice",
+                  trailing = geminiVoiceName,
+                  tone = StatusTone.Neutral,
+                  choices =
+                      Derive.geminiVoices.map { voice ->
+                        val current = voice == hs.geminiVoice
+                        val label = Derive.geminiVoiceDisplayName(voice, emptyList())
+                        RowAction(label, enabled = paired && !current, selected = current) {
+                          setHomeSpeaker("Gemini voice $label", geminiVoice = voice)
+                        }
+                      } +
+                          hs.customVoices
+                              .filter { it.id !in Derive.geminiVoices }
+                              .map { v ->
+                                val current = v.id == hs.geminiVoice
+                                RowAction(
+                                    "${v.name} (cloned)",
+                                    enabled = paired && !current,
+                                    selected = current) {
+                                      setHomeSpeaker("Gemini voice ${v.name}", geminiVoice = v.id)
+                                    }
+                              },
+              ))
+          val hasKey = hs.hasGeminiKey
+          add(
+              ModuleRow(
+                  title = "Gemini API key",
+                  subtitle = if (hasKey) "API key saved on Mac" else "Tap to paste Gemini API key",
+                  trailing = if (hasKey) "saved" else "missing",
+                  tone = if (hasKey) StatusTone.Ok else StatusTone.Warn,
+                  textPrompt =
+                      RowTextPrompt(
+                          title = "Gemini API Key",
+                          hasValue = hasKey,
+                          placeholder = "AIzaSy...",
+                          secret = true,
+                          submitLabel = "Save Key",
+                          clearLabel = if (hasKey) "Clear Key" else null,
+                          onClear =
+                              if (hasKey) {
+                                { setHomeSpeaker("clear Gemini API key", geminiApiKey = "") }
+                              } else null,
+                          onSubmit = { key ->
+                            setHomeSpeaker("save Gemini API key", geminiApiKey = key)
+                          },
+                      ),
+              ))
+        }
+      }
+    } else {
+      // An agent too old to switch outputs always speaks on the home speaker.
+      addSpeakerRow()
+    }
+    // How much to say bounds chat announcements and typed announcements as well as coding agents.
+    add(
+        ModuleRow(
+            title = "How much to say",
+            subtitle = "of each reply, read aloud",
+            trailing = Derive.speechLengthLabel(hs.speechLength),
+            tone = StatusTone.Neutral,
+            choices =
+                Derive.speechLengths.map { wire ->
+                  val current = wire == hs.speechLength
+                  RowAction(
+                      Derive.speechLengthLabel(wire),
+                      enabled = paired && !current,
+                      selected = current) {
+                        setHomeSpeaker("say ${Derive.speechLengthLabel(wire)}", speechLength = wire)
+                      }
+                },
+        ))
+    // How announcements are phrased: only coding-agent replies are rewritten,
+    // so with every coding agent off these shape nothing.
+    if (!Derive.allCodingAgentsOff(
+        hs.announceClaudeCode, hs.announceAntigravity, hs.announceOpenCode)) {
+      add(
+          ModuleRow(
+              title = "Announcement style",
+              subtitle =
+                  if (hs.announcementStyle == "custom")
+                      Format.clip(
+                          hs.customStylePrompt.ifBlank { "no instruction set on the Mac" }, 60)
+                  else "how announcements are phrased before speaking",
+              trailing = Derive.announcementStyleLabel(hs.announcementStyle),
+              tone =
+                  if (hs.announcementStyle == "custom" && hs.customStylePrompt.isBlank())
+                      StatusTone.Warn
+                  else StatusTone.Neutral,
+              choices =
+                  Derive.announcementStyles.map { wire ->
+                    val current = wire == hs.announcementStyle
+                    RowAction(
+                        Derive.announcementStyleLabel(wire),
+                        enabled = paired && !current,
+                        selected = current) {
+                          setHomeSpeaker(
+                              "style ${Derive.announcementStyleLabel(wire)}",
+                              announcementStyle = wire)
+                        }
+                  },
+          ))
+      if (hs.announcementStyle == "custom") {
+        add(
+            ModuleRow(
+                title = "Custom style prompt",
+                subtitle = hs.customStylePrompt.ifBlank { "Tap to set rewrite prompt" },
+                trailing = if (hs.customStylePrompt.isNotBlank()) "set" else "none",
+                textPrompt =
+                    RowTextPrompt(
+                        title = "Custom style prompt",
+                        initialValue = hs.customStylePrompt,
+                        placeholder = "e.g. Speak like a pirate.",
+                        clearLabel = if (hs.customStylePrompt.isNotBlank()) "Clear" else null,
+                        onClear =
+                            if (hs.customStylePrompt.isNotBlank()) {
+                              {
+                                setHomeSpeaker("clear custom style prompt", customStylePrompt = "")
+                              }
+                            } else null,
+                        onSubmit = { text ->
+                          setHomeSpeaker("custom style prompt", customStylePrompt = text)
+                        },
+                    ),
+            ))
+      }
+      if (hs.announcementStyle != "verbatim") {
+        add(
+            ModuleRow(
+                title = "Style model",
+                subtitle =
+                    if (hs.styleModel == "gemini" && !hs.hasGeminiKey)
+                        "needs Gemini API key on the Mac"
+                    else
+                        "rewrites announcements into ${Derive.announcementStyleLabel(hs.announcementStyle)}",
+                trailing = Derive.styleModelLabel(hs.styleModel),
+                tone =
+                    if (hs.styleModel == "gemini" && !hs.hasGeminiKey) StatusTone.Warn
+                    else StatusTone.Neutral,
+                choices =
+                    Derive.styleModels.map { wire ->
+                      val current = wire == hs.styleModel
+                      RowAction(
+                          Derive.styleModelLabel(wire),
+                          enabled = paired && !current,
+                          selected = current) {
+                            setHomeSpeaker(
+                                "style model ${Derive.styleModelLabel(wire)}", styleModel = wire)
+                          }
+                    },
+            ))
+      }
+    }
+    if (homeRelevant) {
+      // The speaker's own volume. −10 / +10 rather than a slider: each change
+      // is a round trip to Google that takes seconds to confirm.
+      agentSpeakerVolume?.let { v ->
+        val usable = paired && v.available && v.online && !speakerVolumeBusy
+        add(
+            ModuleRow(
+                title = "Speaker volume",
+                subtitle =
+                    when {
+                      speakerVolumeBusy -> "changing… Google confirms in a few seconds"
+                      !v.available -> Format.clip(v.reason, 60)
+                      !v.online -> "${v.speaker} is offline"
+                      else -> v.speaker
+                    },
+                // "…" while changing, like the Volume plate: the old level is
+                // not the answer any more, and the new one is not confirmed yet.
+                trailing =
+                    if (speakerVolumeBusy) "…"
+                    else Derive.speakerVolumeLabel(v.available, v.online, v.muted, v.percent),
+                tone = if (v.available && v.online) StatusTone.Ok else StatusTone.Neutral,
+                actions =
+                    if (!v.available) emptyList()
+                    else
+                        listOf(
+                            RowAction("−10", enabled = usable && !v.muted && v.percent > 0) {
+                              setSpeakerVolume(percent = Derive.nextVolume(v.percent, -10))
+                            },
+                            RowAction("+10", enabled = usable && !v.muted && v.percent < 100) {
+                              setSpeakerVolume(percent = Derive.nextVolume(v.percent, 10))
+                            },
+                            RowAction(if (v.muted) "Unmute" else "Mute", enabled = usable) {
+                              setSpeakerVolume(muted = !v.muted)
+                            },
+                        ),
+                choices =
+                    if (usable)
+                        Derive.volumePercentChoices.map { pct ->
+                          val current = pct == v.percent
+                          RowAction("$pct%", enabled = paired && !current, selected = current) {
+                            setSpeakerVolume(percent = pct)
+                          }
+                        }
+                    else emptyList(),
+            ))
+      }
+      // Announce at a set volume: the speaker is set to one level for each
+      // announcement and put back after, on the Mac.
+      add(
+          ModuleRow(
+              title = "Announce at a set volume",
+              subtitle =
+                  if (hs.announceVolumeEnabled)
+                      "each announcement at ${hs.announceVolume}%, then back"
+                  else "announcements use the speaker's own volume",
+              trailing = if (hs.announceVolumeEnabled) "${hs.announceVolume}%" else "off",
+              tone = if (hs.announceVolumeEnabled) StatusTone.Ok else StatusTone.Neutral,
+              toggle =
+                  RowToggle(checked = hs.announceVolumeEnabled, enabled = paired) { next ->
+                    setHomeSpeaker(
+                        "announce volume ${if (next) "on" else "off"}",
+                        announceVolumeEnabled = next)
+                  },
+              actions =
+                  buildList {
+                    if (hs.announceVolumeEnabled) {
+                      add(
+                          RowAction("−10", enabled = paired && hs.announceVolume > 0) {
+                            val next = Derive.nextVolume(hs.announceVolume, -10)
+                            setHomeSpeaker("announce at $next%", announceVolume = next)
+                          })
+                      add(
+                          RowAction("+10", enabled = paired && hs.announceVolume < 100) {
+                            val next = Derive.nextVolume(hs.announceVolume, 10)
+                            setHomeSpeaker("announce at $next%", announceVolume = next)
+                          })
+                    }
+                  },
+              choices =
+                  if (hs.announceVolumeEnabled)
+                      Derive.announceVolumePercentChoices.map { pct ->
+                        val current = pct == hs.announceVolume
+                        RowAction("$pct%", enabled = paired && !current, selected = current) {
+                          setHomeSpeaker("announce volume $pct%", announceVolume = pct)
+                        }
+                      }
+                  else emptyList(),
+          ))
+    }
+    // Pause what the Mac is playing while the speaker talks. The margin is
+    // the one knob worth having here: whether it resumes too early is heard
+    // in the room, not seen at the Mac.
+    add(
+        ModuleRow(
+            title = "Pause media while announcing",
+            // One line on a folded phone: the margin is the part worth
+            // reading, so it is the whole subtitle. "YouTube and other players
+            // on the Mac · " in front of it pushed the number into an ellipsis.
+            subtitle =
+                if (hs.pauseMedia) Derive.pauseMarginLabel(hs.pauseMediaExtraSeconds)
+                else "Mac media keeps playing over the speaker",
+            trailing = if (hs.pauseMedia) "on" else "off",
+            tone = if (hs.pauseMedia) StatusTone.Ok else StatusTone.Neutral,
+            toggle =
+                RowToggle(checked = hs.pauseMedia, enabled = paired) { next ->
+                  setHomeSpeaker("pause media ${if (next) "on" else "off"}", pauseMedia = next)
+                },
+            actions =
+                buildList {
+                  if (hs.pauseMedia) {
+                    val margin = hs.pauseMediaExtraSeconds
+                    add(
+                        RowAction("−1 s", enabled = paired && margin > 0.0) {
+                          val next = Derive.nextPauseMargin(margin, -1.0)
+                          setHomeSpeaker(
+                              Derive.pauseMarginLabel(next), pauseMediaExtraSeconds = next)
+                        })
+                    add(
+                        RowAction("+1 s", enabled = paired && margin < Derive.PAUSE_MARGIN_MAX) {
+                          val next = Derive.nextPauseMargin(margin, 1.0)
+                          setHomeSpeaker(
+                              Derive.pauseMarginLabel(next), pauseMediaExtraSeconds = next)
+                        })
+                    add(
+                        RowAction("Test", enabled = paired) {
+                          setHomeSpeaker("test media pause", testMediaPause = true)
+                        })
+                  }
+                },
+            choices =
+                if (hs.pauseMedia)
+                    Derive.pauseMarginSecondChoices.map { sec ->
+                      val current = hs.pauseMediaExtraSeconds == sec
+                      RowAction(
+                          "${sec.toInt()}s", enabled = paired && !current, selected = current) {
+                            setHomeSpeaker(
+                                "pause margin ${sec.toInt()}s", pauseMediaExtraSeconds = sec)
+                          }
+                    }
+                else emptyList(),
+        ))
+    add(
+        ModuleRow(
+            title = "Quiet hours",
+            subtitle =
+                Derive.quietHoursSubtitle(
+                    enabled = hs.quietHoursEnabled,
+                    active = hs.quietHoursActive,
+                    start = hs.quietHoursStart,
+                    end = hs.quietHoursEnd),
+            trailing = if (hs.quietHoursEnabled) "on" else "off",
+            tone =
+                if (hs.quietHoursEnabled && hs.quietHoursActive) StatusTone.Warn
+                else if (hs.quietHoursEnabled) StatusTone.Ok else StatusTone.Neutral,
+            toggle =
+                RowToggle(checked = hs.quietHoursEnabled, enabled = paired) { next ->
+                  setHomeSpeaker(
+                      "quiet hours ${if (next) "on" else "off"}", quietHoursEnabled = next)
+                },
+        ))
+    if (hs.quietHoursEnabled) {
+      add(
+          ModuleRow(
+              title = "Quiet hours · From",
+              subtitle = "starts at ${hs.quietHoursStart}",
+              trailing = hs.quietHoursStart,
+              choices =
+                  Derive.quietHoursChoices(hs.quietHoursStart).map { t ->
+                    val current = t == hs.quietHoursStart
+                    RowAction(t, enabled = paired && !current, selected = current) {
+                      setHomeSpeaker("quiet hours from $t", quietHoursStart = t)
+                    }
+                  },
+          ))
+      add(
+          ModuleRow(
+              title = "Quiet hours · Until",
+              subtitle = "ends at ${hs.quietHoursEnd}",
+              trailing = hs.quietHoursEnd,
+              choices =
+                  Derive.quietHoursChoices(hs.quietHoursEnd).map { t ->
+                    val current = t == hs.quietHoursEnd
+                    RowAction(t, enabled = paired && !current, selected = current) {
+                      setHomeSpeaker("quiet hours until $t", quietHoursEnd = t)
+                    }
+                  },
+          ))
+    }
+    add(
+        ModuleRow(
+            title = "Speak clipboard",
+            subtitle = "reads text on the Mac clipboard aloud",
+            trailing = "",
+            actions =
+                listOf(
+                    RowAction("Speak", enabled = paired) {
+                      setHomeSpeaker("speak clipboard", speakClipboard = true)
+                    }),
+        ))
+    add(
+        ModuleRow(
+            title = "HomeSpeaker door",
+            subtitle =
+                if (hs.activeDoor == "extension") "running as Vitruvian extension"
+                else "running as standalone app",
+            trailing = hs.activeDoor,
+            choices =
+                listOf("app", "extension").map { d ->
+                  val current = d == hs.activeDoor
+                  RowAction(
+                      if (d == "app") "App" else "Extension",
+                      enabled = paired && !current,
+                      selected = current) {
+                        setHomeSpeaker("door $d", activeDoor = d)
+                      }
+                },
+        ))
+    add(
+        ModuleRow(
+            title = "Settings & diagnostics",
+            subtitle =
+                if (hs.homeSpeakerVersion.isNotBlank()) "HomeSpeaker v${hs.homeSpeakerVersion}"
+                else "HomeSpeaker",
+            // The version is the subtitle already; the row's trailing slot holds the button.
+            trailing = "",
+            actions =
+                listOf(
+                    RowAction(
+                        "Reset settings",
+                        enabled = paired && homeSpeakerBusy == null,
+                        danger = true) {
+                          setHomeSpeaker("reset settings", resetSettings = true)
+                        }),
+        ))
+  }
+
+  /**
+   * The senders HomeSpeaker speaks for (agent v1.10), and its recent broadcasts.
+   *
+   * Each sender list appears only when the Mac sent every switch in it: an older agent gets no
+   * switches rather than ones it would refuse. Every switch sits under Broadcasting -- with that
+   * off nothing is spoken, so the sender lists are not drawn at all; the master switch is the
+   * plate.
+   */
+  /**
+   * Beeper's or Courier's networks as rows, as HomeSpeaker's Settings has them
+   * ([Derive.chatNetworkRow]), then where the others will show while the monitor has not listed
+   * them.
+   */
+  private fun chatNetworkRows(
+      app: String,
+      networks: List<AgentBeeperNetwork>,
+      listed: Boolean?,
+  ): List<ModuleRow> = buildList {
+    networks.forEach { net ->
+      val row = Derive.chatNetworkRow(app, net)
+      add(
+          ModuleRow(
+              title = row.title,
+              subtitle = row.subtitle,
+              trailing = row.trailing,
+              tone = if (row.on) StatusTone.Ok else StatusTone.Neutral,
+              toggle =
+                  when (row.switch) {
+                    Derive.NetworkSwitch.None -> null
+                    Derive.NetworkSwitch.Mute ->
+                        RowToggle(checked = row.on, enabled = paired) { next ->
+                          val what = "$app ${net.name} ${if (next) "on" else "muted"}"
+                          if (app == "Courier")
+                              setHomeSpeaker(
+                                  what, courierNetworkKey = net.key, courierNetworkReading = next)
+                          else
+                              setHomeSpeaker(
+                                  what, beeperNetworkKey = net.key, beeperNetworkReading = next)
+                        }
+                    Derive.NetworkSwitch.ReadAnyway ->
+                        RowToggle(checked = row.on, enabled = paired) { next ->
+                          setHomeSpeaker(
+                              "Courier ${net.name} ${if (next) "also read here" else "read directly"}",
+                              courierReadAnywayKey = net.key,
+                              courierReadAnywayOn = next)
+                        }
+                  },
+          ))
+    }
+    Derive.networksLaterLine(app, listed)?.let {
+      add(
+          ModuleRow(
+              title = "$app · Networks", subtitle = it, trailing = "", tone = StatusTone.Neutral))
+    }
+  }
+
+  private fun homeSpeakerExtraLists(hs: AgentHomeSpeaker): List<ModuleList> = buildList {
+    fun sourceRow(
+        title: String,
+        on: Boolean,
+        onLine: String,
+        offLine: String,
+        set: (Boolean) -> Unit,
+    ): ModuleRow =
+        ModuleRow(
+            title = title,
+            subtitle = if (on) onLine else offLine,
+            trailing = if (on) "on" else "off",
+            tone = if (on) StatusTone.Ok else StatusTone.Neutral,
+            toggle = RowToggle(checked = on, enabled = paired) { next -> set(next) },
+        )
+
+    val claude = hs.announceClaudeCode
+    val antigravity = hs.announceAntigravity
+    val opencode = hs.announceOpenCode
+    // Broadcasting off holds every sender: the switches would only say "held".
+    if (hs.enabled && claude != null && antigravity != null) {
+      add(
+          ModuleList(
+              "Coding agents",
+              buildList {
+                add(
+                    sourceRow(
+                        "Claude Code",
+                        claude,
+                        "its replies are read aloud",
+                        "its replies stay silent") {
+                          setHomeSpeaker(
+                              "Claude Code ${if (it) "on" else "off"}", announceClaudeCode = it)
+                        })
+                add(
+                    sourceRow(
+                        "Antigravity",
+                        antigravity,
+                        "its replies are read aloud",
+                        "its replies stay silent") {
+                          setHomeSpeaker(
+                              "Antigravity ${if (it) "on" else "off"}", announceAntigravity = it)
+                        })
+                if (opencode != null) {
+                  add(
+                      sourceRow(
+                          "OpenCode",
+                          opencode,
+                          "its replies are read aloud",
+                          "its replies stay silent") {
+                            setHomeSpeaker(
+                                "OpenCode ${if (it) "on" else "off"}", announceOpenCode = it)
+                          })
+                }
+                hs.agents.forEach { a ->
+                  val slug = a.canonicalSlug
+                  val isClaude = slug == "claude-code"
+                  val agentName =
+                      when (slug) {
+                        "claude-code" -> "Claude Code"
+                        "antigravity" -> "Antigravity"
+                        "opencode" -> "OpenCode"
+                        else -> a.agent
+                      }
+                  val actions = mutableListOf<RowAction>()
+                  if (isClaude) {
+                    val installed = a.hookState == "installed"
+                    val stale = a.hookState == "stale"
+                    if (a.speaksTwice) {
+                      actions.add(
+                          RowAction(
+                              "Turn off duplicate", enabled = paired && homeSpeakerBusy == null) {
+                                setHomeSpeaker(
+                                    "turn off duplicate $agentName hook",
+                                    agentHookAction = "disable-rival:claude-code")
+                              })
+                    }
+                    if (installed) {
+                      actions.add(
+                          RowAction("Remove hook", enabled = paired && homeSpeakerBusy == null) {
+                            setHomeSpeaker(
+                                "remove $agentName hook", agentHookAction = "remove:claude-code")
+                          })
+                    } else if (stale) {
+                      actions.add(
+                          RowAction("Update hook", enabled = paired && homeSpeakerBusy == null) {
+                            setHomeSpeaker(
+                                "update $agentName hook", agentHookAction = "install:claude-code")
+                          })
+                    } else {
+                      actions.add(
+                          RowAction("Install hook", enabled = paired && homeSpeakerBusy == null) {
+                            setHomeSpeaker(
+                                "install $agentName hook", agentHookAction = "install:claude-code")
+                          })
+                    }
+                    val statusLabel =
+                        Derive.agentHookStatusLabel(
+                            a.hookState, a.speaksTwice, a.configuredByInstruction)
+                    add(
+                        ModuleRow(
+                            title = "$agentName hook",
+                            subtitle = statusLabel,
+                            trailing =
+                                if (installed) "installed" else if (stale) "outdated" else "none",
+                            tone =
+                                if (a.speaksTwice) StatusTone.Warn
+                                else if (installed) StatusTone.Ok
+                                else if (stale) StatusTone.Warn else StatusTone.Neutral,
+                            actions = actions,
+                        ))
+                  } else {
+                    if (!a.configuredByInstruction) {
+                      actions.add(
+                          RowAction(
+                              "Add instruction", enabled = paired && homeSpeakerBusy == null) {
+                                setHomeSpeaker(
+                                    "add instruction to $agentName",
+                                    agentHookAction = "add-instruction:$slug")
+                              })
+                      add(
+                          ModuleRow(
+                              title = "$agentName instruction",
+                              subtitle = "Not configured",
+                              trailing = "none",
+                              tone = StatusTone.Neutral,
+                              actions = actions,
+                          ))
+                    } else {
+                      add(
+                          ModuleRow(
+                              title = "$agentName instruction",
+                              subtitle = "instruction in AGENTS.md / GEMINI.md",
+                              trailing = "configured",
+                              tone = StatusTone.Ok,
+                              actions = emptyList(),
+                          ))
+                    }
+                  }
+                }
+                if (hs.legacyLaunchAgent) {
+                  add(
+                      ModuleRow(
+                          title = "Legacy chat-monitor launch agent",
+                          subtitle =
+                              "Installed by HomeSpeaker 1.x. Chat monitoring now runs inside the app.",
+                          trailing = "legacy",
+                          tone = StatusTone.Warn,
+                          actions =
+                              listOf(
+                                  RowAction("Remove", enabled = paired) {
+                                    setHomeSpeaker(
+                                        "remove legacy agent",
+                                        agentHookAction = "remove-legacy-agent")
+                                  }),
+                      ))
+                }
+              }))
+    }
+    val slack = hs.slackEnabled
+    val googleChat = hs.googleChatEnabled
+    val beeper = hs.beeperEnabled
+    if (hs.enabled && slack != null && googleChat != null && beeper != null) {
+      add(
+          ModuleList(
+              "Chat apps",
+              buildList {
+                val monitorRunning = hs.monitorRunning
+                add(
+                    ModuleRow(
+                        title = "Chat monitor",
+                        subtitle =
+                            if (monitorRunning) "Monitoring chat apps in background"
+                            else "Stopped · background monitor is not running",
+                        trailing = if (monitorRunning) "running" else "stopped",
+                        tone = if (monitorRunning) StatusTone.Ok else StatusTone.Neutral,
+                        toggle =
+                            RowToggle(checked = monitorRunning, enabled = paired) { next ->
+                              setHomeSpeaker(
+                                  "${if (next) "Start" else "Stop"} chat monitor",
+                                  chatMonitorAction = if (next) "start" else "stop")
+                            },
+                    ))
+                add(
+                    sourceRow("Slack", slack, "new messages are read aloud", "not watched") {
+                      setHomeSpeaker("Slack ${if (it) "on" else "off"}", slackEnabled = it)
+                    })
+                if (slack) {
+                  val hasToken = hs.hasSlackToken == true
+                  add(
+                      ModuleRow(
+                          title = "Slack user token",
+                          subtitle =
+                              if (hasToken) "Token saved on Mac"
+                              else "Tap to paste user token (xoxp-...)",
+                          trailing = if (hasToken) "saved" else "missing",
+                          tone = if (hasToken) StatusTone.Ok else StatusTone.Warn,
+                          textPrompt =
+                              RowTextPrompt(
+                                  title = "Slack User Token",
+                                  hasValue = hasToken,
+                                  placeholder = "xoxp-...",
+                                  secret = true,
+                                  submitLabel = "Save Token",
+                                  clearLabel = if (hasToken) "Clear Token" else null,
+                                  onClear =
+                                      if (hasToken) {
+                                        { setHomeSpeaker("clear Slack token", slackToken = "") }
+                                      } else null,
+                                  onSubmit = { token ->
+                                    setHomeSpeaker("save Slack token", slackToken = token)
+                                  },
+                              ),
+                      ))
+                }
+                add(
+                    sourceRow(
+                        "Google Chat", googleChat, "new messages are read aloud", "not watched") {
+                          setHomeSpeaker(
+                              "Google Chat ${if (it) "on" else "off"}", googleChatEnabled = it)
+                        })
+                if (googleChat) {
+                  val currentSource = hs.googleChatSource ?: "auto"
+                  add(
+                      ModuleRow(
+                          title = "Google Chat source",
+                          subtitle = "which backend reads Google Chat",
+                          trailing = Derive.googleChatSourceLabel(currentSource),
+                          tone = StatusTone.Neutral,
+                          choices =
+                              Derive.googleChatSources.map { src ->
+                                val current = src == currentSource
+                                RowAction(
+                                    Derive.googleChatSourceLabel(src),
+                                    enabled = paired && !current,
+                                    selected = current) {
+                                      setHomeSpeaker(
+                                          "Google Chat source ${Derive.googleChatSourceLabel(src)}",
+                                          googleChatSource = src)
+                                    }
+                              },
+                      ))
+                }
+                add(
+                    sourceRow("Beeper", beeper, "new messages are read aloud", "not watched") {
+                      setHomeSpeaker("Beeper ${if (it) "on" else "off"}", beeperEnabled = it)
+                    })
+                if (beeper) {
+                  val hasToken = hs.hasBeeperToken == true
+                  add(
+                      ModuleRow(
+                          title = "Beeper access token",
+                          subtitle =
+                              if (hasToken) "Token saved on Mac"
+                              else "Tap to paste Beeper access token",
+                          trailing = if (hasToken) "saved" else "missing",
+                          tone = if (hasToken) StatusTone.Ok else StatusTone.Warn,
+                          textPrompt =
+                              RowTextPrompt(
+                                  title = "Beeper Access Token",
+                                  hasValue = hasToken,
+                                  placeholder = "Paste access token",
+                                  secret = true,
+                                  submitLabel = "Save Token",
+                                  clearLabel = if (hasToken) "Clear Token" else null,
+                                  onClear =
+                                      if (hasToken) {
+                                        { setHomeSpeaker("clear Beeper token", beeperToken = "") }
+                                      } else null,
+                                  onSubmit = { token ->
+                                    setHomeSpeaker("save Beeper token", beeperToken = token)
+                                  },
+                              ),
+                      ))
+                  add(
+                      ModuleRow(
+                          title = "Beeper · Announce",
+                          subtitle = "which Beeper messages are read aloud",
+                          trailing = Derive.beeperAnnounceLabel(hs.beeperAnnounce),
+                          tone = StatusTone.Neutral,
+                          choices =
+                              Derive.beeperAnnounceModes.map { wire ->
+                                val current = wire == hs.beeperAnnounce
+                                RowAction(
+                                    Derive.beeperAnnounceLabel(wire),
+                                    enabled = paired && !current,
+                                    selected = current) {
+                                      setHomeSpeaker(
+                                          "Beeper announce ${Derive.beeperAnnounceLabel(wire)}",
+                                          beeperAnnounce = wire)
+                                    }
+                              },
+                      ))
+                  addAll(chatNetworkRows("Beeper", hs.beeperNetworks, hs.beeperNetworksListed))
+                }
+                val courier = hs.courierEnabled
+                if (courier != null) {
+                  val hasToken = hs.hasCourierToken
+                  add(
+                      ModuleRow(
+                          title = "Courier",
+                          subtitle =
+                              when {
+                                courier -> "new messages are read aloud"
+                                hasToken -> "not watched"
+                                else -> "needs a token on the Mac first"
+                              },
+                          trailing = if (courier) "on" else "off",
+                          tone = if (courier) StatusTone.Ok else StatusTone.Neutral,
+                          toggle =
+                              RowToggle(
+                                  checked = courier,
+                                  enabled =
+                                      paired && Derive.courierSwitchEnabled(hasToken, courier)) {
+                                    setHomeSpeaker(
+                                        "Courier ${if (it) "on" else "off"}", courierEnabled = it)
+                                  },
+                      ))
+                  // No token field: the token is pasted into HomeSpeaker on the Mac and never
+                  // travels to or from the phone.
+                  if (courier || !hasToken) {
+                    add(
+                        ModuleRow(
+                            title = "Courier access token",
+                            subtitle =
+                                if (hasToken) "Token saved on Mac" else Derive.courierTokenSteps,
+                            trailing = if (hasToken) "saved" else "missing",
+                            tone = if (hasToken) StatusTone.Ok else StatusTone.Warn,
+                        ))
+                  }
+                  if (courier) {
+                    add(
+                        ModuleRow(
+                            title = "Courier · Announce",
+                            subtitle = "which Courier messages are read aloud",
+                            trailing = Derive.beeperAnnounceLabel(hs.courierAnnounce),
+                            tone = StatusTone.Neutral,
+                            choices =
+                                Derive.beeperAnnounceModes.map { wire ->
+                                  val current = wire == hs.courierAnnounce
+                                  RowAction(
+                                      Derive.beeperAnnounceLabel(wire),
+                                      enabled = paired && !current,
+                                      selected = current) {
+                                        setHomeSpeaker(
+                                            "Courier announce ${Derive.beeperAnnounceLabel(wire)}",
+                                            courierAnnounce = wire)
+                                      }
+                                },
+                        ))
+                    addAll(chatNetworkRows("Courier", hs.courierNetworks, hs.courierNetworksListed))
+                  }
+                }
+                val anyChat = slack || googleChat || beeper || courier == true
+                if (anyChat) {
+                  val interval = hs.pollInterval ?: 15
+                  add(
+                      ModuleRow(
+                          title = "Chat poll interval",
+                          subtitle = "how often chat apps are checked",
+                          trailing = Derive.pollIntervalLabel(interval),
+                          tone = StatusTone.Neutral,
+                          choices =
+                              Derive.pollIntervalChoices.map { sec ->
+                                val current = sec == interval
+                                RowAction(
+                                    Derive.pollIntervalLabel(sec),
+                                    enabled = paired && !current,
+                                    selected = current) {
+                                      setHomeSpeaker("poll interval ${sec}s", pollInterval = sec)
+                                    }
+                              },
+                      ))
+                }
+                val muteOwn = hs.muteOwnMessages
+                if (anyChat && muteOwn != null) {
+                  add(
+                      sourceRow(
+                          "Skip messages I sent",
+                          muteOwn,
+                          "messages from your own account stay silent",
+                          "your own messages are read aloud too") {
+                            setHomeSpeaker(
+                                "skip own messages ${if (it) "on" else "off"}",
+                                muteOwnMessages = it)
+                          })
+                }
+              }))
+    }
+    if (hs.customOAuthClientId.isNotBlank() || hs.hasCustomOAuthSecret) {
+      val clientId = hs.customOAuthClientId
+      val hasSecret = hs.hasCustomOAuthSecret
+      add(
+          ModuleList(
+              "Google Cloud OAuth",
+              buildList {
+                add(
+                    ModuleRow(
+                        title = "OAuth Client ID",
+                        subtitle = clientId.ifBlank { "Tap to paste Google Cloud OAuth client ID" },
+                        trailing = if (clientId.isNotBlank()) "configured" else "none",
+                        tone = if (clientId.isNotBlank()) StatusTone.Ok else StatusTone.Neutral,
+                        textPrompt =
+                            RowTextPrompt(
+                                title = "OAuth Client ID",
+                                initialValue = clientId,
+                                placeholder = "...apps.googleusercontent.com",
+                                submitLabel = "Save Client ID",
+                                clearLabel = if (clientId.isNotBlank()) "Clear" else null,
+                                onClear =
+                                    if (clientId.isNotBlank()) {
+                                      {
+                                        setHomeSpeaker("clear OAuth client ID", oauthClientId = "")
+                                      }
+                                    } else null,
+                                onSubmit = { text ->
+                                  setHomeSpeaker("save OAuth client ID", oauthClientId = text)
+                                },
+                            ),
+                    ))
+                add(
+                    ModuleRow(
+                        title = "OAuth Client Secret",
+                        subtitle =
+                            if (hasSecret) "Client secret saved on Mac"
+                            else "Tap to paste client secret",
+                        trailing = if (hasSecret) "saved" else "missing",
+                        tone = if (hasSecret) StatusTone.Ok else StatusTone.Neutral,
+                        textPrompt =
+                            RowTextPrompt(
+                                title = "OAuth Client Secret",
+                                hasValue = hasSecret,
+                                placeholder = "Paste client secret",
+                                secret = true,
+                                submitLabel = "Save Secret",
+                                clearLabel = if (hasSecret) "Clear Secret" else null,
+                                onClear =
+                                    if (hasSecret) {
+                                      {
+                                        setHomeSpeaker(
+                                            "clear OAuth client secret", oauthClientSecret = "")
+                                      }
+                                    } else null,
+                                onSubmit = { secret ->
+                                  setHomeSpeaker(
+                                      "save OAuth client secret", oauthClientSecret = secret)
+                                },
+                            ),
+                    ))
+              }))
+    }
+    // An agent older than v1.10 sends only `last`: a one-row list, still replayable.
+    val recent = hs.recent.ifEmpty { listOfNotNull(hs.last) }
+    if (recent.isNotEmpty()) {
+      // Replay is `HomeSpeaker --say`, which needs the app on this Mac.
+      val canReplay = paired && hs.installed
+      add(
+          ModuleList(
+              "Recent broadcasts",
+              recent.map { b ->
+                ModuleRow(
+                    title = b.text,
+                    subtitle =
+                        Format.parts(
+                            b.target,
+                            b.source,
+                            Format.relativeTime(b.at, System.currentTimeMillis()).ifBlank { b.at }),
+                    trailing = "",
+                    tone = StatusTone.Neutral,
+                    titleLines = 2,
+                    actions =
+                        listOf(
+                            RowAction("Replay", enabled = canReplay) {
+                              replayAnnouncement(b.text, b.id)
+                            }),
+                    onSelect = if (canReplay) ({ replayAnnouncement(b.text, b.id) }) else null,
+                )
+              }))
+    }
+  }
+
+  // The same status, health and outputs line on Home's "Running now" row and
+  // the dashboard header. An agent older than v1.8 does not send the outputs:
+  // read as the app's defaults (home only), which is what that Mac does.
+  private fun speakerStatus(hs: AgentHomeSpeaker): String =
+      Derive.homeSpeakerStatus(
+          hs.available,
+          hs.installed,
+          hs.signedIn,
+          hs.enabled,
+          hs.appRunning,
+          speakHome = hs.speakHome ?: true,
+          speakLocal = hs.speakLocal ?: false,
+          speakPhone = hs.speakPhone ?: false)
+
+  private fun speakerHealth(hs: AgentHomeSpeaker): Derive.SpeakerHealth =
+      Derive.homeSpeakerHealth(
+          hs.available,
+          hs.installed,
+          hs.signedIn,
+          hs.enabled,
+          speakHome = hs.speakHome ?: true,
+          speakLocal = hs.speakLocal ?: false,
+          speakPhone = hs.speakPhone ?: false)
+
+  private fun speakerOutputs(hs: AgentHomeSpeaker): String =
+      Derive.homeSpeakerOutputs(
+          hs.speakHome ?: true,
+          hs.speakLocal ?: false,
+          hs.targets.firstOrNull { it.selected }?.name,
+          hs.speakPhone ?: false)
+
+  private fun speakerSilent(hs: AgentHomeSpeaker): Boolean =
+      hs.speakHome == false && hs.speakLocal == false && hs.speakPhone != true
+
+  /** The HomeSpeaker module with no Mac: says what it needs, invents no speakers. */
+  private fun simulatedHomeSpeakerDashboard(): ModuleDashboard =
+      ModuleDashboard(
+          id = "homespeaker",
+          name = "HomeSpeaker",
+          meta = "on the Mac",
+          status = "simulated · no Mac",
+          statusTone = StatusTone.Neutral,
+          metrics =
+              listOf(
+                  ModuleMetric("Speaker", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Says", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Quiet hours", "n/a", "needs a paired Mac"),
+              ),
+          streamLabel = "Last announcement",
+          lines =
+              listOf(
+                  TerminalLine("$", "GET /v1/homespeaker", TerminalTone.Text),
+                  TerminalLine(
+                      " ", "no Mac is configured, so nothing was asked", TerminalTone.Dim)),
+          cursor = false,
+          prompts = false,
+          listLabel = "Controls and speakers",
+          rows =
+              listOf(
+                  ModuleRow(
+                      "Nothing to show without a Mac",
+                      "pair one that has HomeSpeaker set up",
+                      "n/a",
+                      StatusTone.Neutral)),
+      )
+
+  /**
+   * One change to HomeSpeaker's settings. The reply is the Mac's state read back, so the dashboard
+   * shows what the file now says; a refused change (an unknown speaker, say) surfaces as a log line
+   * and leaves the plate as it was.
+   */
+  private fun setHomeSpeaker(
+      what: String,
+      enabled: Boolean? = null,
+      defaultTarget: String? = null,
+      speechLength: String? = null,
+      quietHoursEnabled: Boolean? = null,
+      quietHoursStart: String? = null,
+      quietHoursEnd: String? = null,
+      customStylePrompt: String? = null,
+      localVoice: String? = null,
+      previewVoice: Boolean = false,
+      pauseMedia: Boolean? = null,
+      pauseMediaExtraSeconds: Double? = null,
+      testMediaPause: Boolean = false,
+      announceVolumeEnabled: Boolean? = null,
+      announceVolume: Int? = null,
+      speakHome: Boolean? = null,
+      speakLocal: Boolean? = null,
+      localEngine: String? = null,
+      geminiVoice: String? = null,
+      announcementStyle: String? = null,
+      styleModel: String? = null,
+      homeCastVoice: Boolean? = null,
+      activeDoor: String? = null,
+      discover: Boolean = false,
+      structureId: String? = null,
+      removeTarget: String? = null,
+      signOut: Boolean = false,
+      importAntigravity: Boolean = false,
+      speakClipboard: Boolean = false,
+      googleChatSource: String? = null,
+      gwsAccount: String? = null,
+      pollInterval: Int? = null,
+      slackToken: String? = null,
+      beeperToken: String? = null,
+      geminiApiKey: String? = null,
+      chatMonitorAction: String? = null,
+      agentHookAction: String? = null,
+      oauthClientId: String? = null,
+      oauthClientSecret: String? = null,
+      resetSettings: Boolean = false,
+      announceClaudeCode: Boolean? = null,
+      announceAntigravity: Boolean? = null,
+      announceOpenCode: Boolean? = null,
+      slackEnabled: Boolean? = null,
+      googleChatEnabled: Boolean? = null,
+      beeperEnabled: Boolean? = null,
+      beeperAnnounce: String? = null,
+      muteOwnMessages: Boolean? = null,
+      beeperNetworkKey: String? = null,
+      beeperNetworkReading: Boolean? = null,
+      speakPhone: Boolean? = null,
+      phonePauseMedia: Boolean? = null,
+      phoneHeadphonesOnly: Boolean? = null,
+      courierEnabled: Boolean? = null,
+      courierAnnounce: String? = null,
+      courierNetworkKey: String? = null,
+      courierNetworkReading: Boolean? = null,
+      courierReadAnywayKey: String? = null,
+      courierReadAnywayOn: Boolean? = null,
+  ) {
+    val client = actClient("homespeaker · $what") ?: return
+    homeSpeakerBusy = what
+    homeSpeakerNotice = null
+    scope.launch {
+      try {
+        runCatching {
+              client.setHomeSpeaker(
+                  enabled = enabled,
+                  defaultTarget = defaultTarget,
+                  speechLength = speechLength,
+                  quietHoursEnabled = quietHoursEnabled,
+                  quietHoursStart = quietHoursStart,
+                  quietHoursEnd = quietHoursEnd,
+                  customStylePrompt = customStylePrompt,
+                  localVoice = localVoice,
+                  previewVoice = previewVoice,
+                  pauseMedia = pauseMedia,
+                  pauseMediaExtraSeconds = pauseMediaExtraSeconds,
+                  testMediaPause = testMediaPause,
+                  announceVolumeEnabled = announceVolumeEnabled,
+                  announceVolume = announceVolume,
+                  speakHome = speakHome,
+                  speakLocal = speakLocal,
+                  localEngine = localEngine,
+                  geminiVoice = geminiVoice,
+                  announcementStyle = announcementStyle,
+                  styleModel = styleModel,
+                  homeCastVoice = homeCastVoice,
+                  activeDoor = activeDoor,
+                  discover = discover,
+                  structureId = structureId,
+                  removeTarget = removeTarget,
+                  signOut = signOut,
+                  importAntigravity = importAntigravity,
+                  speakClipboard = speakClipboard,
+                  googleChatSource = googleChatSource,
+                  gwsAccount = gwsAccount,
+                  pollInterval = pollInterval,
+                  slackToken = slackToken,
+                  beeperToken = beeperToken,
+                  geminiApiKey = geminiApiKey,
+                  chatMonitorAction = chatMonitorAction,
+                  agentHookAction = agentHookAction,
+                  oauthClientId = oauthClientId,
+                  oauthClientSecret = oauthClientSecret,
+                  resetSettings = resetSettings,
+                  announceClaudeCode = announceClaudeCode,
+                  announceAntigravity = announceAntigravity,
+                  announceOpenCode = announceOpenCode,
+                  slackEnabled = slackEnabled,
+                  googleChatEnabled = googleChatEnabled,
+                  beeperEnabled = beeperEnabled,
+                  beeperAnnounce = beeperAnnounce,
+                  muteOwnMessages = muteOwnMessages,
+                  beeperNetworkKey = beeperNetworkKey,
+                  beeperNetworkReading = beeperNetworkReading,
+                  speakPhone = speakPhone,
+                  phonePauseMedia = phonePauseMedia,
+                  phoneHeadphonesOnly = phoneHeadphonesOnly,
+                  courierEnabled = courierEnabled,
+                  courierAnnounce = courierAnnounce,
+                  courierNetworkKey = courierNetworkKey,
+                  courierNetworkReading = courierNetworkReading,
+                  courierReadAnywayKey = courierReadAnywayKey,
+                  courierReadAnywayOn = courierReadAnywayOn,
+              )
+            }
+            .onSuccess {
+              agentHomeSpeaker = it
+              homeSpeakerNotice = "✓ homespeaker · $what" to StatusTone.Ok
+              log("info", "homespeaker · $what")
+              // A different speaker has a different volume; show it now.
+              if (defaultTarget != null && !speakerVolumeBusy) {
+                runCatching { client.homeSpeakerVolume() }.onSuccess { v -> agentSpeakerVolume = v }
+              }
+            }
+            .onFailure {
+              homeSpeakerNotice =
+                  "✗ homespeaker · $what: ${
+                    if (it is AgentAuthException) failureText(it) else it.message ?: "failed"
+                  }" to
+                      StatusTone.Crit
+              actFailed("homespeaker · $what", it)
+            }
+      } finally {
+        homeSpeakerBusy = null
+      }
+    }
+  }
+
+  /**
+   * Changes the default speaker's volume (or mutes it) and shows what Google reports afterwards --
+   * which takes seconds, so the row says so meanwhile rather than showing the old level.
+   */
+  private fun setSpeakerVolume(percent: Int? = null, muted: Boolean? = null) {
+    val what = if (percent != null) "volume $percent%" else if (muted == true) "mute" else "unmute"
+    val client = actClient("homespeaker · $what") ?: return
+    speakerVolumeBusy = true
+    scope.launch {
+      runCatching { client.setHomeSpeakerVolume(percent, muted) }
+          .onSuccess { v ->
+            agentSpeakerVolume = v
+            if (v.available) log("info", "homespeaker · $what")
+            else log("warn", "homespeaker · $what · ${v.reason.ifBlank { "refused" }}")
+          }
+          .onFailure { actFailed("homespeaker · $what", it) }
+      speakerVolumeBusy = false
+    }
+  }
+
+  public fun updateAnnounceDraft(value: String) {
+    announceDraft = value
+  }
+
+  /** Speaks the draft on the Mac's default speaker, through `HomeSpeaker --say`. */
+  public fun announce() {
+    val text = announceDraft.trim()
+    if (text.isEmpty()) return
+    val client = actClient("homespeaker · say") ?: return
+    scope.launch {
+      runCatching { client.homeSpeakerSay(text) }
+          .onSuccess { result ->
+            if (result.ok) {
+              announceDraft = ""
+              log("info", "homespeaker · said \"${Format.clip(text, 60)}\"")
+              // The history file now has this at the top; show it without
+              // waiting for the slow poll.
+              runCatching { client.homeSpeaker() }.onSuccess { agentHomeSpeaker = it }
+            } else {
+              log(
+                  "warn",
+                  "homespeaker · not spoken · ${result.output.ifBlank { "no reason given" }}")
+            }
+          }
+          .onFailure { actFailed("homespeaker · say", it) }
+    }
+  }
+
+  /**
+   * Speaks a recent broadcast again, through the same `HomeSpeaker --say` as the Say box: the
+   * master switch holds, quiet hours do not. The Mac lists it again in its history.
+   */
+  public fun replayAnnouncement(text: String, id: String? = null) {
+    val line = text.trim()
+    if (line.isEmpty() && id.isNullOrBlank()) return
+    val client = actClient("homespeaker · replay") ?: return
+    scope.launch {
+      runCatching { client.homeSpeakerSay(line, replay = true, replayId = id) }
+          .onSuccess { result ->
+            if (result.ok) {
+              log("info", "homespeaker · replayed \"${Format.clip(line, 60)}\"")
+              runCatching { client.homeSpeaker() }.onSuccess { agentHomeSpeaker = it }
+            } else {
+              log(
+                  "warn",
+                  "homespeaker · not replayed · ${result.output.ifBlank { "no reason given" }}")
+            }
+          }
+          .onFailure { actFailed("homespeaker · replay", it) }
+    }
+  }
+
+  // --- Sony Google TV ------------------------------------------------------
+
+  /** Sony Google TV dashboard driven over wireless ADB (`GET/POST /v1/tv`). */
+  private fun tvDashboard(): ModuleDashboard {
+    val tv = agentTv
+    val address = tv?.address?.ifBlank { TvWire.DEFAULT_ADDRESS } ?: TvWire.DEFAULT_ADDRESS
+    val status =
+        if (tv == null) "asking…"
+        else Derive.tvStatus(tv.available, tv.connected, tv.awake, tv.dreaming)
+    val tone =
+        when {
+          tv == null -> StatusTone.Neutral
+          !tv.available || !tv.connected -> StatusTone.Warn
+          tv.dreaming -> StatusTone.Run
+          tv.awake -> StatusTone.Ok
+          else -> StatusTone.Neutral
+        }
+    val canAct = paired && tv?.available == true && tvBusyAction == null
+    val isReconnecting = tvBusyAction == "reconnect"
+    val isAwakeOrDreaming = tv?.connected == true && (tv.awake || tv.dreaming)
+    val head = TerminalLine("$", "adb -s $address shell", TerminalTone.Text)
+    val baseLines =
+        when {
+          tv == null -> listOf(head, TerminalLine(" ", "asking…", TerminalTone.Dim))
+          !tv.available ->
+              listOf(
+                  head,
+                  TerminalLine(
+                      " ",
+                      tv.reason.ifBlank { "adb is not installed on this Mac" },
+                      TerminalTone.Warn))
+          !tv.connected ->
+              listOf(
+                  head,
+                  TerminalLine(
+                      " ",
+                      tv.reason.ifBlank { "could not connect to $address" },
+                      TerminalTone.Warn))
+          else ->
+              listOf(
+                  head,
+                  TerminalLine(
+                      " ",
+                      "${tv.foreground} · ${if (tv.dreaming) "Dreaming" else if (tv.awake) "Awake" else "Standby"} · ${tv.memAvailableMb} MB free",
+                      TerminalTone.Ok))
+        }
+    val lines =
+        if (tvLastFeedback.isNotBlank()) {
+          baseLines + TerminalLine("›", tvLastFeedback, tvLastFeedbackTone)
+        } else {
+          baseLines
+        }
+
+    val rows = buildList {
+      if (tv == null) {
+        add(ModuleRow("Asking the Mac…", "GET /v1/tv", "", StatusTone.Neutral))
+      } else {
+        if (!tv.available) {
+          add(
+              ModuleRow(
+                  "ADB unavailable on Mac",
+                  tv.reason.ifBlank { "Install android-platform-tools on the Mac" },
+                  "no adb",
+                  StatusTone.Warn))
+        }
+        add(
+            ModuleRow(
+                title = "Power",
+                subtitle =
+                    when {
+                      isAwakeOrDreaming -> "TV is on · ${tv.foreground}"
+                      tv.connected -> "TV is in standby"
+                      else -> "Wake or sleep Sony TV over ADB"
+                    },
+                trailing = if (isAwakeOrDreaming) "on" else "standby",
+                tone = if (isAwakeOrDreaming) StatusTone.Ok else StatusTone.Neutral,
+                toggle =
+                    RowToggle(checked = isAwakeOrDreaming, enabled = canAct) {
+                      actTv("toggle power", action = "toggle_power")
+                    },
+                actions =
+                    listOf(
+                        RowAction("4K Aerials", enabled = canAct) {
+                          actTv("start 4K aerials", action = "start_aerial")
+                        }),
+            ))
+        add(
+            ModuleRow(
+                title = "TV ADB address",
+                subtitle =
+                    when {
+                      isReconnecting -> "$address · disconnecting & reconnecting over ADB…"
+                      !tv.connected && tv.reason.isNotBlank() -> "$address · ${tv.reason}"
+                      else -> address
+                    },
+                trailing =
+                    when {
+                      isReconnecting -> "reconnecting…"
+                      tv.connected -> "connected"
+                      else -> "offline"
+                    },
+                tone =
+                    when {
+                      isReconnecting -> StatusTone.Run
+                      tv.connected -> StatusTone.Ok
+                      else -> StatusTone.Warn
+                    },
+                actions =
+                    listOf(
+                        RowAction(
+                            if (isReconnecting) "Reconnecting…" else "Reconnect",
+                            enabled = canAct) {
+                              actTv("reconnect TV", action = "reconnect")
+                            }),
+                textPrompt =
+                    RowTextPrompt(
+                        title = "Sony TV ADB Address",
+                        initialValue = address,
+                        hasValue = address.isNotBlank(),
+                        placeholder = TvWire.DEFAULT_ADDRESS,
+                        submitLabel = "Save Address",
+                        onSubmit = { next ->
+                          actTv(
+                              "address ${next.trim()}",
+                              action = "set_address",
+                              address = next.trim())
+                        },
+                    ),
+            ))
+        add(
+            ModuleRow(
+                title = "Trim cache",
+                subtitle =
+                    if (tv.memAvailableMb > 0) "${tv.memAvailableMb} MB available · pm trim-caches"
+                    else "Free cached app data on TV",
+                trailing = if (tv.memAvailableMb > 0) "${tv.memAvailableMb} MB" else "",
+                tone = StatusTone.Neutral,
+                actions =
+                    listOf(
+                        RowAction("Trim", enabled = canAct) {
+                          actTv("trim caches", action = "trim_caches")
+                        }),
+            ))
+      }
+    }
+
+    val extraLists =
+        if (tv == null) emptyList()
+        else
+            listOf(
+                ModuleList(
+                    "Apps",
+                    listOf(
+                            Triple("Projectivy", "projectivy", "Projectivy Home"),
+                            Triple("SmartTube 4K", "smarttube", "SmartTube 4K"),
+                            Triple("Disney+", "disney", "Disney+"),
+                            Triple("Netflix", "netflix", "Netflix"),
+                        )
+                        .map { (label, target, fgName) ->
+                          val active = tv.connected && tv.foreground == fgName
+                          ModuleRow(
+                              title = label,
+                              subtitle =
+                                  if (active) "Currently in foreground" else "Launch on Sony TV",
+                              trailing = if (active) "active" else "",
+                              tone = if (active) StatusTone.Ok else StatusTone.Neutral,
+                              actions =
+                                  listOf(
+                                      RowAction("Launch", enabled = canAct, selected = active) {
+                                        actTv(
+                                            "launch $label", action = "launch_app", target = target)
+                                      }),
+                          )
+                        }),
+                ModuleList(
+                    "HDMI Inputs",
+                    listOf(
+                        ModuleRow(
+                            title = "HDMI passthrough",
+                            subtitle = "Switch Sony Bravia external input",
+                            trailing = "",
+                            tone = StatusTone.Neutral,
+                            actions =
+                                listOf("1", "2", "3", "4").map { port ->
+                                  RowAction("HDMI $port", enabled = canAct) {
+                                    actTv("HDMI $port", action = "hdmi", target = port)
+                                  }
+                                },
+                        ))),
+                ModuleList(
+                    "Remote & Volume",
+                    listOf(
+                        ModuleRow(
+                            title = "Volume & playback",
+                            subtitle = "Audio level and media transport",
+                            trailing = "",
+                            tone = StatusTone.Neutral,
+                            actions =
+                                listOf(
+                                    RowAction("Vol -", enabled = canAct) {
+                                      actTv("volume down", action = "key", target = "volume_down")
+                                    },
+                                    RowAction("Mute", enabled = canAct) {
+                                      actTv("mute", action = "key", target = "mute")
+                                    },
+                                    RowAction("Vol +", enabled = canAct) {
+                                      actTv("volume up", action = "key", target = "volume_up")
+                                    },
+                                    RowAction("Play/Pause", enabled = canAct) {
+                                      actTv("play/pause", action = "key", target = "play_pause")
+                                    },
+                                ),
+                        ),
+                        ModuleRow(
+                            title = "D-Pad navigation",
+                            subtitle = "Directional pad and select",
+                            trailing = "",
+                            tone = StatusTone.Neutral,
+                            actions =
+                                listOf(
+                                    RowAction("Up", enabled = canAct) {
+                                      actTv("up", action = "key", target = "up")
+                                    },
+                                    RowAction("Down", enabled = canAct) {
+                                      actTv("down", action = "key", target = "down")
+                                    },
+                                    RowAction("Left", enabled = canAct) {
+                                      actTv("left", action = "key", target = "left")
+                                    },
+                                    RowAction("Right", enabled = canAct) {
+                                      actTv("right", action = "key", target = "right")
+                                    },
+                                    RowAction("Select", enabled = canAct) {
+                                      actTv("select", action = "key", target = "select")
+                                    },
+                                ),
+                        ),
+                        ModuleRow(
+                            title = "System navigation",
+                            subtitle = "Home and Back keys",
+                            trailing = "",
+                            tone = StatusTone.Neutral,
+                            actions =
+                                listOf(
+                                    RowAction("Home", enabled = canAct) {
+                                      actTv("home", action = "key", target = "home")
+                                    },
+                                    RowAction("Back", enabled = canAct) {
+                                      actTv("back", action = "key", target = "back")
+                                    },
+                                ),
+                        ),
+                    )),
+            )
+
+    return ModuleDashboard(
+        id = "tv",
+        name = "Sony TV",
+        meta = Format.parts(address, shortHostName().ifBlank { null }),
+        status = status,
+        statusTone = tone,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Status",
+                    when {
+                      tv == null -> "…"
+                      !tv.available -> "no adb"
+                      !tv.connected -> "offline"
+                      tv.dreaming -> "Dreaming"
+                      tv.awake -> "Awake"
+                      else -> "Standby"
+                    },
+                    address),
+                ModuleMetric(
+                    "Foreground",
+                    tv?.foreground ?: "…",
+                    if (tv?.connected == true) "active window" else "adb status"),
+                ModuleMetric(
+                    "Memory",
+                    if (tv != null && tv.connected && tv.memAvailableMb > 0)
+                        "${tv.memAvailableMb} MB"
+                    else "—",
+                    "available RAM"),
+            ),
+        streamLabel = "ADB · $address",
+        lines = lines,
+        cursor = false,
+        prompts = false,
+        composer =
+            ModuleComposer(
+                placeholder = "Paste YouTube / video URL to cast to SmartTube…",
+                buttonLabel = "Cast",
+                value = tvCastDraft,
+                enabled = canAct && tvCastDraft.trim().isNotEmpty(),
+                onValueChange = ::updateTvCastDraft,
+                onSubmit = ::castTvUrl,
+            ),
+        listLabel = "Power & Quick Actions",
+        rows = rows,
+        extraLists = extraLists,
+    )
+  }
+
+  /** The Sony TV module with no Mac configured. */
+  private fun simulatedTvDashboard(): ModuleDashboard =
+      ModuleDashboard(
+          id = "tv",
+          name = "Sony TV",
+          meta = "via ADB on the Mac",
+          status = "simulated · no Mac",
+          statusTone = StatusTone.Neutral,
+          metrics =
+              listOf(
+                  ModuleMetric("Status", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Foreground", "n/a", "needs a paired Mac"),
+                  ModuleMetric("Memory", "n/a", "needs a paired Mac"),
+              ),
+          streamLabel = "ADB · ${TvWire.DEFAULT_ADDRESS}",
+          lines =
+              listOf(
+                  TerminalLine("$", "GET /v1/tv", TerminalTone.Text),
+                  TerminalLine(
+                      " ", "no Mac is configured, so nothing was asked", TerminalTone.Dim)),
+          cursor = false,
+          prompts = false,
+          listLabel = "Power & Quick Actions",
+          rows =
+              listOf(
+                  ModuleRow(
+                      "Nothing to show without a Mac",
+                      "pair one that has adb installed on the LAN",
+                      "n/a",
+                      StatusTone.Neutral)),
+      )
+
+  public fun updateTvCastDraft(value: String) {
+    tvCastDraft = value
+  }
+
+  public fun castTvUrl() {
+    val url = tvCastDraft.trim()
+    if (url.isEmpty()) return
+    val client = actClient("tv · cast URL") ?: return
+    scope.launch {
+      runCatching { client.actTv(action = "cast_url", url = url) }
+          .onSuccess { st ->
+            agentTv = st
+            tvCastDraft = ""
+            log("info", "tv · cast ${Format.clip(url, 48)} to SmartTube")
+          }
+          .onFailure { actFailed("tv · cast URL", it) }
+    }
+  }
+
+  private fun actTv(
+      what: String,
+      action: String,
+      target: String = "",
+      url: String = "",
+      address: String = "",
+  ) {
+    val client = actClient("tv · $what") ?: return
+    tvBusyAction = action
+    tvLastFeedback = "running: $what…"
+    tvLastFeedbackTone = TerminalTone.Dim
+    scope.launch {
+      val startedAt = System.currentTimeMillis()
+      val result = runCatching {
+        client.actTv(action = action, target = target, url = url, address = address)
+      }
+      val elapsed = System.currentTimeMillis() - startedAt
+      if (elapsed < 400L) {
+        kotlinx.coroutines.delay(400L - elapsed)
+      }
+      tvBusyAction = null
+      result
+          .onSuccess { st ->
+            agentTv = st
+            if (action == "reconnect" || action == "set_address") {
+              tvReconnectCount += 1
+              if (st.connected) {
+                tvLastFeedback = "connected to ${st.address} (#$tvReconnectCount)"
+                tvLastFeedbackTone = TerminalTone.Ok
+              } else {
+                tvLastFeedback =
+                    "reconnect #$tvReconnectCount sent to ${st.address} → still offline (${st.reason.ifBlank { "no answer" }})"
+                tvLastFeedbackTone = TerminalTone.Warn
+              }
+            } else {
+              tvLastFeedback = "$what → ok (${st.foreground})"
+              tvLastFeedbackTone = TerminalTone.Ok
+            }
+            log("info", "tv · $what")
+          }
+          .onFailure {
+            tvLastFeedback = "$what failed: ${failureText(it)}"
+            tvLastFeedbackTone = TerminalTone.Err
+            actFailed("tv · $what", it)
+          }
+    }
+  }
+
+  /**
+   * Antigravity, the way Claude Code's dashboard works (API v1.7): its conversations and a prompt
+   * box that continues the selected one (or starts one). The version, models and agents it always
+   * showed stay. An agent without the sessions endpoint gets exactly the old dashboard.
+   *
+   * No permission prompts here: in agy 1.2.11 a hook's "allow" does not skip agy's own prompt, and
+   * a headless run still refuses a command that needs permission, so there is nothing the phone
+   * could approve. Such a command is refused and the reply says so.
+   */
+  private fun antigravityDashboard(): ModuleDashboard {
+    val old = antigravityModelsDashboard()
+    if (antigravitySessionsSupported == false) return old
+    val ag = agentAntigravity
+    val available = ag?.available == true
+    val list = agentAntigravitySessions
+    val sessions = list?.sessions.orEmpty()
+    val selected = selectedAntigravitySession
+    return old.copy(
+        meta =
+            Format.parts(
+                    if (available)
+                        Derive.antigravitySummary(
+                            ag?.version.orEmpty(),
+                            ag?.models?.size ?: 0,
+                            list?.let { sessions.size })
+                    else null,
+                    shortHostName().ifBlank { null },
+                )
+                .ifBlank { old.meta },
+        streamLabel =
+            if (selected != null) "Conversation · ${antigravitySessionName(selected)}"
+            else "Transcript · this phone",
+        lines = antigravityLines(selected),
+        cursor = antigravityRunning,
+        markdown = true,
+        composer =
+            ModuleComposer(
+                placeholder =
+                    Derive.antigravityPlaceholder(selected?.let(::antigravitySessionName)),
+                buttonLabel = if (antigravityRunning) "Stop" else "Send",
+                value = antigravityPrompt,
+                enabled = antigravityRunning || antigravityPrompt.isNotBlank(),
+                onValueChange = ::updateAntigravityPrompt,
+                onSubmit = if (antigravityRunning) ::stopCommand else ::sendAntigravityPrompt,
+            ),
+        listLabel = "Sessions",
+        rows =
+            when {
+              list == null ->
+                  listOf(
+                      ModuleRow("Asking the Mac…", "agy's conversations", "", StatusTone.Neutral))
+              !list.available ->
+                  listOf(
+                      ModuleRow(
+                          "No conversations",
+                          Format.clip(list.reason.ifBlank { "the agent did not say why" }),
+                          "",
+                          StatusTone.Neutral))
+              sessions.isEmpty() ->
+                  listOf(
+                      ModuleRow("No conversations yet", "Send starts one", "0", StatusTone.Neutral))
+              else -> sessions.map(::antigravitySessionRow)
+            },
+        extraLists =
+            listOf(
+                ModuleList("Models", antigravityModelRows(ag)),
+                ModuleList("Agents", old.rows),
+            ),
+    )
+  }
+
+  private val selectedAntigravitySession: AgentAntigravitySession?
+    get() = agentAntigravitySessions?.sessions?.firstOrNull { it.id == selectedAntigravityId }
+
+  /** A conversation's name: agy's title, else its first words, else its project. */
+  private fun antigravitySessionName(session: AgentAntigravitySession): String =
+      Format.clip(
+          session.title
+              .ifBlank { session.preview }
+              .ifBlank { session.project }
+              .ifBlank { "untitled" })
+
+  /** The selected conversation's last words on the Mac, above this phone's own exchanges. */
+  private fun antigravityLines(session: AgentAntigravitySession?): List<TerminalLine> {
+    if (session == null) return antigravityTranscript.toList()
+    val head = mutableListOf<TerminalLine>()
+    head += TerminalLine(" ", "last from ${antigravitySessionName(session)}", TerminalTone.Dim)
+    head +=
+        if (session.preview.isNotBlank()) TerminalLine("‹", session.preview, TerminalTone.Text)
+        else TerminalLine("‹", "no preview from agy", TerminalTone.Dim)
+    return head + antigravityTranscript.toList()
+  }
+
+  private fun antigravitySessionRow(session: AgentAntigravitySession): ModuleRow {
+    val look = Derive.sessionLook(session.state)
+    return ModuleRow(
+        title = antigravitySessionName(session),
+        subtitle =
+            Format.parts(
+                session.project.ifBlank { null },
+                if (session.steps > 0) "${session.steps} step${plural(session.steps)}" else null,
+            ),
+        trailing =
+            Format.relativeTime(session.updatedAt, System.currentTimeMillis()).ifBlank {
+              session.updatedAt
+            },
+        tone = lookTone(look),
+        tag = Derive.claudeStateLabel(session.state),
+        tagTone = lookTagTone(look),
+        selected = session.id == selectedAntigravityId,
+        onSelect = { selectAntigravitySession(session.id) },
+    )
+  }
+
+  private fun antigravityModelRows(ag: AgentAntigravity?): List<ModuleRow> =
+      when {
+        ag == null -> listOf(ModuleRow("Asking…", "agy models", "", StatusTone.Neutral))
+        !ag.available -> listOf(ModuleRow("No models", ag.reason, "", StatusTone.Neutral))
+        ag.models.isEmpty() ->
+            listOf(ModuleRow("No models", "agy models printed nothing", "0", StatusTone.Neutral))
+        else ->
+            ag.models.map { (id, label) -> ModuleRow(label.ifBlank { id }, id, "", StatusTone.Ok) }
+      }
+
+  /** Picks the conversation Send continues; tapping the selected one clears it. */
+  public fun selectAntigravitySession(id: String) {
+    selectedAntigravityId = if (selectedAntigravityId == id) null else id
+  }
+
+  public fun updateAntigravityPrompt(value: String) {
+    antigravityPrompt = value
+  }
+
+  /**
+   * Send, on the Antigravity module: `agy -p` on the Mac, continuing the selected conversation or
+   * starting a new one, with its output streamed here line by line. Stop hangs up, which is what
+   * makes the agent kill agy -- the same machinery as the console.
+   */
+  public fun sendAntigravityPrompt() {
+    val text = antigravityPrompt.trim()
+    if (text.isEmpty()) return
+    val session = selectedAntigravitySession
+    val conversation = session?.id.orEmpty()
+    val name = session?.let(::antigravitySessionName)
+    // Held by identity, as on Claude's: removed when the first line lands.
+    val placeholder = TerminalLine(" ", "thinking…", TerminalTone.Dim)
+    var first = true
+    val finish = {
+      antigravityTranscript.remove(placeholder)
+      antigravityRunning = false
+    }
+    stream(
+        what = "antigravity · prompt",
+        kind = ExecKind.Shell,
+        command = text,
+        run = { client, handle, onLine ->
+          client.antigravityResume(conversation, text, handle, onLine)
+        },
+        onLine = { pipe, line ->
+          if (first) {
+            first = false
+            antigravityTranscript.remove(placeholder)
+          }
+          antigravityTranscript.add(
+              TerminalLine(
+                  " ", line, if (pipe == "stderr") TerminalTone.Warn else TerminalTone.Dim))
+        },
+        onEnd = { result ->
+          finish()
+          when {
+            result.cancelled ->
+                antigravityTranscript.add(TerminalLine(" ", "stopped", TerminalTone.Warn))
+            result.exitCode != 0 ->
+                antigravityTranscript.add(
+                    TerminalLine(" ", "agy exited ${result.exitCode}", TerminalTone.Err))
+          }
+          // A new conversation shows up in the list on the next read; ask now.
+          refreshAntigravitySessions()
+        },
+        onError = {
+          finish()
+          antigravityTranscript.add(TerminalLine(" ", failureText(it), TerminalTone.Err))
+          actFailed("antigravity · prompt", it)
+        },
+    ) {
+      antigravityTranscript.add(TerminalLine("›", text, TerminalTone.Text))
+      if (name == null) {
+        antigravityTranscript.add(TerminalLine(" ", "new conversation", TerminalTone.Dim))
+      }
+      antigravityTranscript.add(placeholder)
+      antigravityPrompt = ""
+      antigravityRunning = true
+      log("info", "antigravity · prompt → ${name ?: "new conversation"}")
+    }
+  }
+
+  /** One read of the conversations, off the poll's schedule. */
+  private fun refreshAntigravitySessions() {
+    if (agentUrl.isBlank()) return
+    val client = AgentClient(agentUrl, agentToken)
+    scope.launch { pollAntigravitySessions(client) }
+  }
+
+  private suspend fun pollAntigravitySessions(client: AgentClient) {
+    runCatching { client.antigravitySessions() }
+        .onSuccess {
+          agentAntigravitySessions = it
+          antigravitySessionsSupported = true
+        }
+        .onFailure { e ->
+          if (e is AgentNotFoundException) {
+            if (antigravitySessionsSupported != false) {
+              log("info", "antigravity · this Mac agent predates sessions and prompts")
+            }
+            antigravitySessionsSupported = false
+            agentAntigravitySessions = null
+          }
+        }
+  }
+
+  /** What the dashboard showed before v1.7: the models listing and the agents. */
+  private fun antigravityModelsDashboard(): ModuleDashboard {
+    val ag = agentAntigravity
+    val available = ag?.available == true
+    val head = TerminalLine("$", "agy models", TerminalTone.Text)
+    val lines =
+        when {
+          ag == null -> listOf(head, TerminalLine(" ", "asking…", TerminalTone.Dim))
+          !ag.available -> listOf(head, TerminalLine(" ", ag.reason, TerminalTone.Warn))
+          else ->
+              listOf(head) +
+                  ag.models.map { (id, label) ->
+                    TerminalLine(" ", "$id  $label", TerminalTone.Dim)
+                  }
+        }
+    return ModuleDashboard(
+        id = "antigravity",
+        name = "Antigravity",
+        meta = "agy models · agy agents",
+        status = if (available) "v${ag?.version}" else "no source",
+        statusTone = if (available) StatusTone.Ok else StatusTone.Neutral,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Version",
+                    if (available) ag?.version.orEmpty() else "n/a",
+                    "as agy reports it"),
+                ModuleMetric(
+                    "Models", if (available) "${ag?.models?.size ?: 0}" else "n/a", "it can run"),
+                ModuleMetric(
+                    "Agents", if (available) "${ag?.agents?.size ?: 0}" else "n/a", "configured"),
+            ),
+        streamLabel = "agy models",
+        lines = lines,
+        cursor = false,
+        prompts = false,
+        listLabel = "Agents",
+        rows =
+            if (ag?.agents.isNullOrEmpty())
+                listOf(
+                    ModuleRow(
+                        "No agents configured",
+                        "agy agents printed nothing",
+                        "0",
+                        StatusTone.Neutral))
+            else ag!!.agents.map { ModuleRow(it, "agy agent", "ok", StatusTone.Ok) },
+    )
+  }
+
+  private fun grafanaDashboard(): ModuleDashboard {
+    val r = promqlResult
+    val head = TerminalLine("$", promql, TerminalTone.Text)
+    val lines =
+        when {
+          r == null -> listOf(head, TerminalLine(" ", promqlStatus, TerminalTone.Dim))
+          !r.available -> listOf(head, TerminalLine(" ", r.reason, TerminalTone.Warn))
+          else ->
+              listOf(
+                  head,
+                  TerminalLine(" ", "${r.resultType} · ${r.seriesCount} series", TerminalTone.Ok))
+        }
+    val name = { labels: Map<String, String> ->
+      labels["instance"]
+          ?: labels["__name__"]
+          ?: labels.entries.firstOrNull()?.let { "${it.key}=${it.value}" }
+          ?: "series"
+    }
+    return ModuleDashboard(
+        id = "grafana",
+        name = "Grafana panel",
+        meta = "PromQL, run on the Mac",
+        status = if (r?.available == true) "${r.seriesCount} series" else promqlStatus,
+        statusTone = if (r?.available == true) StatusTone.Ok else StatusTone.Neutral,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Series",
+                    if (r?.available == true) "${r.seriesCount}" else "n/a",
+                    r?.resultType.orEmpty().ifBlank { "run a query" }),
+                ModuleMetric(
+                    "First value",
+                    r?.firstValue?.let { "%.4g".format(it) } ?: "n/a",
+                    "newest sample"),
+                // The value slot is one short line of 26 sp display type;
+                // a metric name is longer than that every time, so the
+                // query goes in the sub-line and the value names the kind.
+                ModuleMetric("Query", "PromQL", promql),
+            ),
+        streamLabel = "query",
+        lines = lines,
+        cursor = false,
+        prompts = false,
+        listLabel = "Series",
+        rows =
+            r?.series?.take(SERIES_ROWS)?.map { s ->
+              ModuleRow(
+                  name(s.labels),
+                  s.labels
+                      .filterKeys { it != "instance" && it != "__name__" }
+                      .entries
+                      .take(3)
+                      .joinToString(" · ") { "${it.key}=${it.value}" }
+                      .ifBlank { "no other labels" },
+                  s.value?.let { "%.4g".format(it) } ?: "n/a",
+                  StatusTone.Ok)
+            } ?: emptyList(),
+    )
+  }
+
+  private fun ollamaDashboard(): ModuleDashboard {
+    val o = agentOllama
+    val available = o?.available == true
+    val loaded = o?.running?.size ?: 0
+    val models = o?.models ?: emptyList()
+    val head = TerminalLine("$", "ollama ps", TerminalTone.Text)
+    val lines =
+        when {
+          o == null -> listOf(head, TerminalLine(" ", "asking…", TerminalTone.Dim))
+          !o.available -> listOf(head, TerminalLine(" ", o.reason, TerminalTone.Warn))
+          o.running.isEmpty() ->
+              listOf(head, TerminalLine(" ", "no model loaded", TerminalTone.Dim))
+          else ->
+              listOf(head) +
+                  o.running.map {
+                    TerminalLine(
+                        " ",
+                        "${it.name}  ${it.processor}  ctx ${it.context}  ${it.until}",
+                        TerminalTone.Ok)
+                  }
+        }
+    return ModuleDashboard(
+        id = "ollama",
+        name = "Ollama",
+        meta = "ollama list · ollama ps",
+        status =
+            when {
+              !available -> "no source"
+              loaded > 0 -> "$loaded loaded"
+              else -> "idle"
+            },
+        statusTone = if (available) StatusTone.Ok else StatusTone.Neutral,
+        metrics =
+            listOf(
+                ModuleMetric("Models", if (available) "${models.size}" else "n/a", "installed"),
+                ModuleMetric("Loaded", if (available) "$loaded" else "n/a", "in memory now"),
+                ModuleMetric(
+                    "On disk",
+                    if (available) Format.formatBytes(models.sumOf { it.sizeBytes }) else "n/a",
+                    "all models"),
+            ),
+        streamLabel = "ollama ps",
+        lines = lines,
+        cursor = false,
+        prompts = false,
+        listLabel = "Models",
+        rows =
+            models.map { m ->
+              val running = o?.running?.any { it.name == m.name } == true
+              ModuleRow(
+                  m.name,
+                  Format.parts(Format.formatBytes(m.sizeBytes), m.modified),
+                  if (running) "loaded" else "on disk",
+                  if (running) StatusTone.Ok else StatusTone.Neutral,
+              )
+            },
+    )
+  }
+
+  private fun dockerDashboard(): ModuleDashboard {
+    val c = agentContainers
+    val available = c?.available == true
+    val runtime = c?.detail?.ifBlank { "docker" } ?: "docker"
+    return ModuleDashboard(
+        id = "docker",
+        name = "Docker",
+        meta = "$runtime ps",
+        status = if (available) "${c?.items?.size ?: 0} running" else "no source",
+        statusTone = if (available) StatusTone.Ok else StatusTone.Neutral,
+        metrics =
+            listOf(
+                ModuleMetric(
+                    "Containers",
+                    if (available) "${c?.items?.size ?: 0}" else "n/a",
+                    "running now"),
+                ModuleMetric("Runtime", if (available) runtime else "n/a", "docker or podman"),
+                ModuleMetric("CPU", "n/a", "needs docker stats"),
+            ),
+        streamLabel = "$runtime ps",
+        lines = summaryLines("$runtime ps", c) { "${it.name}  ${it.image}  ${it.status}" },
+        cursor = false,
+        prompts = false,
+        listLabel = "Containers",
+        // The Mac screen's grouping: no pause sandboxes, one row per pod.
+        rows = containers.map { ModuleRow(it.name, it.subtitle, it.trailing, StatusTone.Ok) },
+    )
+  }
+
+  /**
+   * The dashboard for a module with nothing behind it on this Mac.
+   *
+   * Says exactly that, and names the source the gallery advertises, so the reason it is empty is on
+   * the screen rather than in someone's head. The alternative -- keeping the mock -- puts invented
+   * build numbers next to real ones and nothing distinguishes them.
+   */
+  private fun unwiredDashboard(id: String): ModuleDashboard {
+    val entry = MockHost.gallery.firstOrNull { it.id == id }
+    return ModuleDashboard(
+        id = id,
+        name = entry?.name ?: id,
+        meta = entry?.subtitle.orEmpty(),
+        status = moduleUnavailableReason(id) ?: "no data source yet",
+        statusTone = StatusTone.Neutral,
+        metrics = listOf(ModuleMetric("Source", entry?.source ?: "unknown", "what it would use")),
+        streamLabel = "Stream",
+        lines = emptyList(),
+        cursor = false,
+        prompts = false,
+        listLabel = entry?.name ?: id,
+        rows =
+            listOf(
+                ModuleRow(
+                    moduleUnavailableReason(id) ?: "Not wired to this Mac yet",
+                    if (moduleUnavailableReason(id) != null)
+                        "install it on the Mac and it will show up here"
+                    else "the agent has no endpoint for it",
+                    "n/a",
+                    StatusTone.Neutral,
+                )),
+    )
+  }
+
+  /** A command line plus one line per row, or the reason there are none. */
+  private fun <T> summaryLines(
+      command: String,
+      list: AgentList<T>?,
+      row: (T) -> String,
+  ): List<TerminalLine> {
+    val head = TerminalLine("$", command, TerminalTone.Text)
+    if (list == null) return listOf(head, TerminalLine(" ", "asking…", TerminalTone.Dim))
+    if (!list.available) {
+      return listOf(head, TerminalLine(" ", list.reason, TerminalTone.Warn))
+    }
+    if (list.items.isEmpty()) {
+      return listOf(head, TerminalLine(" ", "no rows", TerminalTone.Dim))
+    }
+    return listOf(head) + list.items.map { TerminalLine(" ", row(it), TerminalTone.Dim) }
+  }
+
+  /** Only installed modules that actually ship a dashboard get a chip. */
+  public val moduleChips: List<GalleryEntry>
+    get() = MockHost.gallery.filter { it.id in installed && it.id in moduleDashboards }
+
+  public val currentModule: ModuleDashboard
+    get() = moduleDashboards[module] ?: moduleDashboards.getValue("claude")
+
+  /**
+   * The id [currentModule] resolves to, without building every dashboard to find out: the poll
+   * reads this on each pass and on every change of state.
+   */
+  private val currentModuleId: String
+    get() = if (MockHost.gallery.any { it.id == module }) module else "claude"
+
+  /**
+   * The memory bar, filled from the pressure figure above it rather than from a constant.
+   *
+   * It used to be a fixed 7-on, 2-warn pattern sitting directly under a percentage it never
+   * matched: the number could read 41% or 88% and the bar looked identical.
+   */
+  public val memorySegments: List<SegState>
+    get() {
+      val pressure = (memoryPlate.percent ?: 0).coerceIn(0, 100)
+      val lit = MEMORY_SEGMENTS * pressure / 100
+      val warnFrom = MEMORY_SEGMENTS * MEMORY_WARN_PERCENT / 100
+      return List(MEMORY_SEGMENTS) { index ->
+        when {
+          index >= lit -> SegState.Empty
+          index >= warnFrom -> SegState.Warn
+          else -> SegState.On
+        }
+      }
+    }
+
+  public val networkDown: String
+    get() = "${(net.last() * DOWN_FACTOR).roundToInt()} Mb/s"
+
+  public val networkUp: String
+    get() = "${(net.last() * UP_FACTOR).roundToInt()} Mb/s"
+
+  /**
+   * The PromQL panel's own rows, for the Mac screen.
+   *
+   * Empty until a query has come back, which is what keeps the dashed placeholder on screen. There
+   * is still no chart here -- the panel shows the series and their newest values, which is what the
+   * reply actually contains.
+   */
+  public val promqlPanelRows: List<PanelRow>
+    get() {
+      val result = promqlResult ?: return emptyList()
+      if (!result.available) return emptyList()
+      return result.series.take(PANEL_ROWS).map { series ->
+        PanelRow(
+            name =
+                series.labels["instance"]
+                    ?: series.labels["__name__"]
+                    ?: series.labels.entries.firstOrNull()?.let { "${it.key}=${it.value}" }
+                    ?: "series",
+            value = series.value?.let { "%.4g".format(it) } ?: "n/a",
+        )
+      }
+    }
+
+  /** The dialog currently open, resolved to its copy. */
+  public val dialogSpec: DialogSpec?
+    get() = dialog?.let { DialogSpec.of(it, wakeOnLan, confirmDestructive, hostShortName) }
+
+  /** A destructive dialog's action stays disabled until the word is typed exactly. */
+  public val dialogBlocked: Boolean
+    get() {
+      val word = dialogSpec?.word ?: return false
+      return confirmText.trim().lowercase(Locale.ROOT) != word
+    }
+
+  public val macroSaveBlocked: Boolean
+    get() = macroName.isBlank() || macroCommand.isBlank()
+
+  // --- the tick ---------------------------------------------------------
+
+  /**
+   * Advances the live series until cancelled.
+   *
+   * A random walk clamped to plausible bounds, matching the prototype's shape; the point of the
+   * motion is that the dashboards read as live, not that the numbers mean anything yet.
+   */
+  public suspend fun runMetrics(): Unit = coroutineScope {
+    // Whatever changes what is on screen -- a tab, a module, the gallery, the
+    // app going to the background and back -- wakes the loop at once, so a
+    // module that has just opened is asked for now rather than at the next tick.
+    launch {
+      snapshotFlow { pollView }.distinctUntilChanged().drop(1).collect { pollWake.trySend(Unit) }
+    }
+    var last = monotonicMs()
+    var pairAskMs = 0L
+    while (true) {
+      val live = agentUrl.isNotBlank()
+      val wait =
+          if (live) Derive.pollWaitMs(pollView, refreshMillis, monotonicMs(), lastFetched)
+          else TICK_MS
+      val woken = withTimeoutOrNull(wait) { pollWake.receive() } != null
+      val now = monotonicMs()
+      val elapsed = now - last
+      last = now
+      // Counted from the time actually elapsed rather than from a wall clock:
+      // the code's five minutes are five minutes of this loop, which is the
+      // only thing that can ask the Mac for the token. Asked at most once a
+      // tick, however often the loop wakes.
+      pairAskMs += elapsed
+      val ask = pairAskMs >= (if (live) refreshMillis else TICK_MS)
+      if (ask) pairAskMs = 0
+      tickPairing(elapsed, ask)
+      // The trust countdown reads against this, so it advances with the rest
+      // of the screen instead of freezing at whatever it said when the last
+      // tool ran.
+      bridgeNowMs = System.currentTimeMillis()
+      if (!live) {
+        // The simulated walk moves on the tick, not on every navigation.
+        if (!woken) advance()
+      } else {
+        pollAgent(now)
+      }
+    }
+  }
+
+  /** Woken when what is on screen changes, so the newly visible is fetched now. */
+  private val pollWake = Channel<Unit>(Channel.CONFLATED)
+
+  /** When each source was last asked for, on [monotonicMs]. Cleared with the host. */
+  private val lastFetched = HashMap<Derive.PollSource, Long>()
+
+  /** What was on screen at the last pass that reached the Mac; what comes on screen is due now. */
+  private var lastVisible: Map<Derive.PollSource, Long>? = null
+
+  private fun monotonicMs(): Long = System.nanoTime() / NANOS_PER_MS
+
+  /**
+   * What is on screen, as far as the poll is concerned. See [Derive.pollCadences] for what each
+   * screen and module draws, and so asks for.
+   */
+  private val pollView: Derive.PollView
+    get() =
+        Derive.PollView(
+            page =
+                when (effectiveScreen) {
+                  Screen.Home -> Derive.PollPage.Home
+                  Screen.Remote -> Derive.PollPage.Remote
+                  Screen.Mac -> Derive.PollPage.Mac
+                  Screen.Apps -> Derive.PollPage.Apps
+                  Screen.Console -> Derive.PollPage.Console
+                  Screen.Hosts -> Derive.PollPage.Hosts
+                },
+            module = currentModuleId,
+            appsDashboards = appsView == AppsView.Dashboards,
+            foreground = foreground,
+            antigravitySessionsSupported = antigravitySessionsSupported != false,
+        )
+
+  /**
+   * How often to ask, honouring the Hosts screen's setting.
+   *
+   * Only when an agent is configured. The simulated walk keeps its own cadence: the setting is
+   * about how hard to lean on a real machine, and there is nothing to lean on otherwise.
+   */
+  private val refreshMillis: Long
+    get() =
+        refreshInterval
+            .filter { it.isDigit() }
+            .toLongOrNull()
+            ?.times(1000L)
+            ?.coerceAtLeast(MIN_POLL_MS) ?: TICK_MS
+
+  /**
+   * Runs the pairing code's clock down, and offers the code to the Mac while it lasts.
+   *
+   * The phone polls rather than the Mac pushing, because the Mac has nowhere to push to: the agent
+   * is a server on the tailnet and the phone is not. A 403 is the ordinary answer until someone
+   * runs the `pair` subcommand, so it is not logged -- it would be a warning every tick for as long
+   * as the code is on screen.
+   */
+  private suspend fun tickPairing(elapsedMs: Long, ask: Boolean) {
+    if (pairMillisLeft > 0) pairMillisLeft = (pairMillisLeft - elapsedMs).coerceAtLeast(0)
+    if (pairMillisLeft <= 0) qrPairPending = false
+    // Already paired only stops the tick when no QR pairing is in flight: a
+    // scan replaces the token, but only once the new one is in hand.
+    if (!ask || agentUrl.isBlank() || (paired && !qrPairPending) || pairMillisLeft <= 0) return
+    val token = runCatching { AgentClient(agentUrl).pair(pairCode) }.getOrNull() ?: return
+    qrPairPending = false
+    updateSelected { it.copy(token = token) }
+    pairRejected = false
+    log("ok", "pairing · paired with ${agentHost?.hostname ?: agentHostLabel()}")
+    // The bridge re-reads the token only between attempts, up to a minute
+    // apart; dial now so "not linked · not paired" clears with the pairing.
+    if (bridgeEnabled) bridge?.reconnect()
+  }
+
+  private fun advance() {
+    cpu.removeAt(0)
+    cpu.add((cpu.last() + walk(CPU_STEP)).coerceIn(CPU_MIN, CPU_MAX))
+    net.removeAt(0)
+    net.add((net.last() + walk(NET_STEP)).coerceIn(NET_MIN, NET_MAX))
+    gpu = (gpu + walk(GPU_STEP)).coerceIn(GPU_MIN, GPU_MAX)
+    ane = (ane + walk(ANE_STEP)).coerceIn(0, ANE_MAX)
+    temperature = (temperature + walk(TEMP_STEP)).coerceIn(TEMP_MIN, TEMP_MAX)
+    fanRpm = FAN_BASE + temperature * FAN_PER_DEGREE
+    powerDraw = DRAW_BASE + cpu.last() / DRAW_DIVISOR
+  }
+
+  private fun walk(step: Int): Int = ((random.nextDouble() - 0.5) * step).roundToInt()
+
+  // --- actions ----------------------------------------------------------
+
+  public fun go(target: Screen) {
+    screen = target
+  }
+
+  public fun openModule(id: String) {
+    module = id
+    appsView = AppsView.Dashboards
+    screen = Screen.Apps
+  }
+
+  /**
+   * A module named by a deep link. Only a module the gallery knows: a link naming anything else
+   * still opened Apps, and that is as far as it should go.
+   */
+  public fun openLinkedModule(id: String) {
+    if (MockHost.gallery.any { it.id == id }) openModule(id)
+  }
+
+  public fun selectModule(id: String) {
+    module = id
+    // The panel module is the query's table; open it and the query runs.
+    if (id == "grafana" && promqlResult == null && agentUrl.isNotBlank()) runPromql()
+  }
+
+  public fun showAppsView(view: AppsView) {
+    appsView = view
+  }
+
+  public fun toggleDock() {
+    dockOpen = !dockOpen
+    persistence.dockOpen = dockOpen
+  }
+
+  public fun toggleEditMode() {
+    editMode = !editMode
+  }
+
+  public fun hideWidget(id: String) {
+    if (id !in hiddenWidgets) {
+      hiddenWidgets.add(id)
+      persistence.hiddenWidgets = hiddenWidgets.toList()
+    }
+  }
+
+  public fun restoreWidgets() {
+    hiddenWidgets.clear()
+    persistence.hiddenWidgets = emptyList()
+  }
+
+  /**
+   * Switches Macs.
+   *
+   * Everything derived from the old host is dropped, not carried over: the process list, the VMs,
+   * the container list and the last metrics all belonged to a different machine, and leaving them
+   * on screen under a new name is the most convincing lie this app could tell.
+   */
+  public fun selectHost(id: String) {
+    if (id == selectedHostId) return
+    val entry = hosts.firstOrNull { it.id == id } ?: return
+    selectedHostId = id
+    persistence.selectedHostId = id
+    // A QR code belongs to the Mac it was scanned for, not whichever is next.
+    qrPairPending = false
+    agentUrlDraft = entry.url
+    hostAliasDraft = entry.alias
+    resetHostSnapshots()
+    log("info", "host · switched to ${entry.alias.ifBlank { entry.url }}")
+  }
+
+  /** Adds a Mac and switches to it. Pairing is per host, so the new one starts unpaired. */
+  public fun addHost(url: String) {
+    val trimmed = url.trim()
+    if (trimmed.isBlank()) return
+    val entry =
+        AgentHostEntry(
+            id = "host-${System.currentTimeMillis()}",
+            alias = HostCodec.aliasFor(trimmed),
+            url = trimmed,
+            token = "",
+            mac = "",
+        )
+    hosts = hosts + entry
+    persistence.hosts = hosts
+    newHostDraft = ""
+    selectedHostId = entry.id
+    persistence.selectedHostId = entry.id
+    agentUrlDraft = entry.url
+    hostAliasDraft = entry.alias
+    resetHostSnapshots()
+    regeneratePairCode()
+    log("info", "host · added ${entry.alias} · ${AgentClient.normalize(entry.url)}")
+  }
+
+  /**
+   * Forgets one Mac, and its token with it.
+   *
+   * The token goes because a phone with no host holding a key that still opens it is the worst of
+   * both. Removing the selected one falls back to whatever is left, or to the simulated state.
+   */
+  public fun forgetHost(id: String) {
+    val entry = hosts.firstOrNull { it.id == id } ?: return
+    hosts = hosts.filterNot { it.id == id }
+    persistence.hosts = hosts
+    if (id == selectedHostId) {
+      val next = hosts.firstOrNull()
+      selectedHostId = next?.id.orEmpty()
+      persistence.selectedHostId = selectedHostId
+      agentUrlDraft = next?.url.orEmpty()
+      hostAliasDraft = next?.alias.orEmpty()
+      // Before the log line, not after: the reset clears the event stream,
+      // which belonged to the Mac that was just forgotten.
+      resetHostSnapshots()
+      regeneratePairCode()
+    }
+    log("info", "host · forgot ${entry.alias.ifBlank { entry.url }}")
+  }
+
+  public fun updateHostAliasDraft(value: String) {
+    hostAliasDraft = value
+  }
+
+  public fun updateNewHostDraft(value: String) {
+    newHostDraft = value
+  }
+
+  /** Adds the Mac typed into the "Add a Mac" row. */
+  public fun addTypedHost() {
+    addHost(newHostDraft)
+  }
+
+  /** Rewrites the selected entry in place, in state and on disk together. */
+  private fun updateSelected(transform: (AgentHostEntry) -> AgentHostEntry) {
+    val current = selectedHost ?: return
+    hosts = hosts.map { if (it.id == current.id) transform(it) else it }
+    persistence.hosts = hosts
+  }
+
+  public fun toggleTheme() {
+    darkTheme = !darkTheme
+    persistence.darkTheme = darkTheme
+  }
+
+  public fun updateWakeOnLan(value: Boolean) {
+    wakeOnLan = value
+  }
+
+  public fun updateConfirmDestructive(value: Boolean) {
+    confirmDestructive = value
+  }
+
+  public fun updateRefreshInterval(value: String) {
+    refreshInterval = value
+  }
+
+  /**
+   * Pairs with the Mac a confirmed QR code named.
+   *
+   * Reuses the host if this phone already knows that address -- a rotated token is the usual reason
+   * to scan again -- and adds it otherwise. The code is the Mac's, not one this phone invented: the
+   * Mac already opened its pairing window for it, so the ordinary pairing tick claims the token on
+   * its next pass.
+   */
+  public fun pairFromQr(link: PairLink) {
+    val target = AgentClient.normalize(link.url)
+    val existing = hosts.firstOrNull { AgentClient.normalize(it.url) == target }
+    if (existing != null) {
+      selectHost(existing.id)
+    } else {
+      addHost(link.url)
+    }
+    val name = link.name
+    // The old token stays until the new one arrives: a QR scanned while the
+    // Mac is unreachable must not cost a pairing that was working.
+    if (name.isNotBlank()) updateSelected { it.copy(alias = name) }
+    qrPairPending = true
+    if (name.isNotBlank()) hostAliasDraft = name
+    pairCode = formatPairCode(link.code.toInt())
+    pairMillisLeft = PAIR_TTL_MS
+    screen = Screen.Hosts
+    log("info", "pairing · from QR · ${name.ifBlank { target }}")
+  }
+
+  public fun regeneratePairCode() {
+    // A new code is this phone's own again, not the Mac's from a QR.
+    qrPairPending = false
+    pairCode = formatPairCode(random.nextInt(PAIR_CODE_BOUND))
+    pairMillisLeft = PAIR_TTL_MS
+  }
+
+  public fun toggleModule(id: String) {
+    val name = MockHost.gallery.first { it.id == id }.name
+    moduleUnavailableReason(id)?.let { why ->
+      if (id !in installed) {
+        log("warn", "module · $name · $why")
+        return
+      }
+    }
+    if (id in installed) {
+      installed.remove(id)
+      log("info", "module · $name removed")
+    } else {
+      installed.add(id)
+      log("ok", "module · $name installed")
+    }
+    persistence.installed = installed.toList()
+  }
+
+  public fun sideload(): Unit = log("warn", "module · sideload by URL is not implemented yet")
+
+  public fun openInstallGuide(): Unit =
+      log(
+          "warn",
+          "pairing · install guide not written yet; see mobile/android/remote/macagent/README.md")
+
+  /**
+   * Runs a macro on the Mac.
+   *
+   * This used to print `ok — done` unconditionally, which was a lie in the one case that matters:
+   * when nothing ran. Now either the command's real output lands in the console, or the log says
+   * the phone is not paired and nothing else happens.
+   */
+  public fun runMacro(macro: Macro) {
+    stream(
+        what = "macro · ${macro.label}",
+        kind = execKind(macro.kind),
+        command = macro.command,
+        onLine = { stream, text -> emit(terminalLine(stream, text)) },
+        onEnd = { result -> emit(exitLine(result)) },
+        onError = { emitFailure("macro · ${macro.label}", it) },
+    ) {
+      emit(TerminalLine("$", macro.command, TerminalTone.Text))
+    }
+  }
+
+  /** How a macro's kind reaches the contract's `kind` field. */
+  private fun execKind(kind: MacroKind): ExecKind =
+      when (kind) {
+        MacroKind.Ssh -> ExecKind.Shell
+        MacroKind.AppleScript -> ExecKind.AppleScript
+        MacroKind.Shortcut -> ExecKind.Shortcut
+      }
+
+  public fun openMacroEditor() {
+    macroEditorOpen = true
+  }
+
+  public fun closeMacroEditor() {
+    macroEditorOpen = false
+  }
+
+  public fun updateMacroName(value: String) {
+    macroName = value
+  }
+
+  public fun updateMacroCommand(value: String) {
+    macroCommand = value
+  }
+
+  public fun updateMacroKind(value: MacroKind) {
+    macroKind = value
+  }
+
+  public fun updateMacroConfirm(value: Boolean) {
+    macroConfirm = value
+  }
+
+  public fun saveMacro() {
+    if (macroSaveBlocked) return
+    val saved =
+        Macro(
+            id = "u${System.currentTimeMillis()}",
+            label = macroName.trim(),
+            command = macroCommand.trim(),
+            kind = macroKind,
+            confirm = macroConfirm,
+        )
+    userMacros.add(0, saved)
+    persistence.userMacros = userMacros.toList()
+    log("ok", "macro · \"${saved.label}\" saved")
+    macroEditorOpen = false
+    macroName = ""
+    macroCommand = ""
+    macroConfirm = false
+  }
+
+  // --- controls ---------------------------------------------------------
+  //
+  // Each of these drives the real Mac when a Bluetooth host is connected, and
+  // falls back to the mock when it is not. The local state still moves either
+  // way: a keyboard is write-only, so the Mac never tells us its real volume
+  // and the slider is our best guess rather than a reading. Worth remembering
+  // before anyone treats these numbers as telemetry.
+
+  public fun togglePlay() {
+    playing = !playing
+    sendHid(HidAction.PlayPause)
+  }
+
+  public fun previousTrack() {
+    log("info", "media · previous")
+    sendHid(HidAction.PreviousTrack)
+  }
+
+  public fun nextTrack() {
+    log("info", "media · next")
+    sendHid(HidAction.NextTrack)
+  }
+
+  /**
+   * Volume up or down.
+   *
+   * The key press is the real mechanism and needs no pairing -- it is HID, like every other button
+   * on this plate. What changed is where the NUMBER comes from: the local guess still moves so the
+   * bar responds instantly, but once an agent is live the displayed percent is whatever `/v1/audio`
+   * last said, and the guess is invisible. Two keys pressed on the Mac itself used to leave this
+   * slider permanently wrong with no way to notice.
+   */
+  public fun nudgeVolume(delta: Int) {
+    volume = (volume + delta).coerceIn(0, 100)
+    sendHid(if (delta >= 0) HidAction.VolumeUp else HidAction.VolumeDown)
+  }
+
+  public fun nudgeBrightness(delta: Int) {
+    brightness = (brightness + delta).coerceIn(0, 100)
+    sendHid(if (delta >= 0) HidAction.BrightnessUp else HidAction.BrightnessDown)
+  }
+
+  /** Mission Control, Spaces and friends: the chords the esp32-s3 board already proves work. */
+  public fun sendMacChord(action: HidAction) {
+    sendHid(action)
+    log("info", "desktop · ${desktopLabel(action)}")
+  }
+
+  /**
+   * A readable name for the Console log.
+   *
+   * Matched on identity rather than switched on a label the UI passes in, so the log cannot drift
+   * from what was actually sent.
+   */
+  private fun desktopLabel(action: HidAction): String =
+      when (action) {
+        HidAction.MissionControl -> "mission control"
+        HidAction.AppExpose -> "app exposé"
+        HidAction.ShowDesktop -> "show desktop"
+        HidAction.Launchpad -> "launchpad"
+        HidAction.SpaceLeft -> "space left"
+        HidAction.SpaceRight -> "space right"
+        HidAction.Spotlight -> "spotlight"
+        HidAction.ScreenshotFull -> "screenshot"
+        HidAction.ScreenshotRegion -> "screenshot · region"
+        HidAction.ScreenshotUi -> "screenshot · capture ui"
+        HidAction.CmdTab -> "switch app"
+        HidAction.CycleWindows -> "cycle windows"
+        HidAction.CloseWindow -> "close window"
+        HidAction.MinimiseWindow -> "minimise"
+        HidAction.HideApp -> "hide app"
+        HidAction.Fullscreen -> "fullscreen"
+        HidAction.ForceQuit -> "force quit"
+        HidAction.DisplaySleepChord -> "sleep the display"
+        HidAction.LockScreen -> "lock the screen"
+        else -> "key"
+      }
+
+  private fun sendHid(action: HidAction) {
+    val sender = hid ?: return
+    if (!sender.send(action)) {
+      // The press is the retry: ask the link to come back now rather than
+      // waiting for the user to leave the app and return. The Remote screen
+      // shows the link state above the trackpad, so this is not silent.
+      sender.reconnect()
+      log("warn", "bluetooth · not connected to $hostShortName · reconnecting")
+    }
+  }
+
+  /**
+   * Toggles display mirroring with Cmd+F1.
+   *
+   * Real, and free: it is a key press, so it works with no agent and no pairing. The switch stays
+   * local because HID is write-only -- macOS never tells us which way the toggle landed, so what
+   * the switch shows is what we asked for, and the log says exactly what was sent.
+   */
+  public fun toggleMirror() {
+    mirror = !mirror
+    sendHid(HidAction.MirrorDisplays)
+    log("info", "display · sent ⌘F1")
+  }
+
+  /**
+   * Relative movement, already a delta.
+   *
+   * The gesture layer reports deltas, so there is nothing to subtract here. Long moves are still
+   * split across reports because one report carries only -127..127 per axis.
+   */
+  public fun movePointerBy(dx: Float, dy: Float, buttons: Int = HidCodes.MOUSE_BUTTON_NONE) {
+    var remainingX = (dx * tuning.pointerGain).roundToInt()
+    var remainingY = (dy * tuning.pointerGain).roundToInt()
+    if (remainingX == 0 && remainingY == 0) return
+    val sender = hid ?: return
+    while (remainingX != 0 || remainingY != 0) {
+      val stepX = remainingX.coerceIn(-127, 127)
+      val stepY = remainingY.coerceIn(-127, 127)
+      sender.sendPointer(stepX, stepY, buttons)
+      remainingX -= stepX
+      remainingY -= stepY
+    }
+  }
+
+  /** Scroll from a delta, accumulating sub-notch movement. */
+  public fun scrollByDelta(dy: Float): Boolean {
+    val delta = -dy / tuning.scrollDivisor + scrollRemainder
+    val notches = delta.toInt()
+    scrollRemainder = delta - notches
+    if (notches == 0) return false
+    return hid?.sendPointer(dx = 0, dy = 0, wheel = notches) ?: false
+  }
+
+  /** True while a hold-to-drag is armed, so movement carries the button down. */
+  private var dragging = false
+
+  /**
+   * Presses and HOLDS the left button.
+   *
+   * Not a click: the button stays down until [endDrag], so the moves in between are a drag on the
+   * Mac rather than a pointer move. This is the one place a button is deliberately left pressed.
+   */
+  public fun beginDrag(): Boolean {
+    val sender = hid ?: return false
+    if (!sender.sendPointer(dx = 0, dy = 0, buttons = HidCodes.MOUSE_BUTTON_LEFT)) {
+      log("warn", "bluetooth · no host connected")
+      return false
+    }
+    dragging = true
+    return true
+  }
+
+  /** Movement with the button still down. */
+  public fun dragBy(dx: Float, dy: Float) {
+    if (!dragging) return
+    movePointerBy(dx, dy, HidCodes.MOUSE_BUTTON_LEFT)
+  }
+
+  /**
+   * Lifts the button.
+   *
+   * Runs even if the drag never armed cleanly. A button left down on the Mac turns every later
+   * pointer move into a selection, and nothing in the UI would ever lift it.
+   */
+  public fun endDrag() {
+    if (!dragging) return
+    dragging = false
+    hid?.sendPointer(dx = 0, dy = 0, buttons = HidCodes.MOUSE_BUTTON_NONE)
+  }
+
+  /** Returns false when nothing was sent, so the caller can skip the haptic. */
+  public fun click(): Boolean = tapButton(HidCodes.MOUSE_BUTTON_LEFT)
+
+  public fun rightClick(): Boolean = tapButton(HidCodes.MOUSE_BUTTON_RIGHT)
+
+  /** Scrolls the Mac. Positive scrolls up, matching the wheel axis. */
+  public fun scroll(amount: Int) {
+    hid?.sendPointer(dx = 0, dy = 0, wheel = amount)
+  }
+
+  /**
+   * Where the two-finger gesture last was, so scrolling is sent as a delta like pointer movement.
+   */
+
+  /**
+   * Leftover sub-notch movement, so slow scrolling accumulates instead of rounding away to zero.
+   */
+  private var scrollRemainder = 0f
+
+  /**
+   * Press and release one mouse button in place.
+   *
+   * The release is mandatory: a button left down on the host makes the next pointer movement a
+   * drag, and there is nothing in the UI that would ever lift it again.
+   */
+  private fun tapButton(button: Int): Boolean {
+    val sender = hid ?: return false
+    if (!sender.sendPointer(dx = 0, dy = 0, buttons = button)) {
+      log("warn", "bluetooth · no host connected")
+      return false
+    }
+    sender.sendPointer(dx = 0, dy = 0, buttons = HidCodes.MOUSE_BUTTON_NONE)
+    return true
+  }
+
+  /** Called by the transport whenever the Bluetooth link changes. */
+  public fun onHidLinkChanged(link: HidLinkState) {
+    hidLink = link
+  }
+
+  /** The Reconnect button above the trackpad. */
+  public fun reconnectHid() {
+    hid?.reconnect()
+    log("info", "bluetooth · reconnecting to $hostShortName")
+  }
+
+  public fun toggleKeyboard() {
+    keyboardOpen = !keyboardOpen
+  }
+
+  public fun toggleTuning() {
+    tuningOpen = !tuningOpen
+  }
+
+  /** Nudge by whole steps so the value always lands on the grid the bounds are defined on. */
+  public fun nudgePointerSpeed(steps: Int) {
+    updateTuning(
+        tuning.copy(
+            pointerPercent =
+                TrackpadTuning.clampPercent(
+                    tuning.pointerPercent + steps * TrackpadTuning.PERCENT_STEP)))
+  }
+
+  public fun nudgeScrollSpeed(steps: Int) {
+    updateTuning(
+        tuning.copy(
+            scrollPercent =
+                TrackpadTuning.clampPercent(
+                    tuning.scrollPercent + steps * TrackpadTuning.PERCENT_STEP)))
+  }
+
+  public fun nudgeDragHold(steps: Int) {
+    updateTuning(
+        tuning.copy(
+            dragHoldMillis =
+                TrackpadTuning.clampDragHold(
+                    tuning.dragHoldMillis + steps * TrackpadTuning.DRAG_HOLD_STEP_MILLIS)))
+  }
+
+  /** Back to the shipped values, for when tuning has gone somewhere unusable. */
+  public fun resetTuning() {
+    updateTuning(TrackpadTuning())
+    log("info", "trackpad · feel reset to defaults")
+  }
+
+  private fun updateTuning(next: TrackpadTuning) {
+    if (next == tuning) return
+    tuning = next
+    persistence.trackpadTuning = next
+  }
+
+  public fun updateAgentUrlDraft(value: String) {
+    agentUrlDraft = value
+  }
+
+  /**
+   * Names the selected Mac, or clears the name.
+   *
+   * Applied on a button for the same reason the URL is: every keystroke would otherwise rename the
+   * machine in the top bar, the rail and three screen headers at once.
+   */
+  public fun saveHostAlias() {
+    val next = hostAliasDraft.trim()
+    if (next == selectedHost?.alias.orEmpty()) return
+    updateSelected { it.copy(alias = next) }
+    log("info", if (next.isBlank()) "host · name cleared" else "host · now called \"$next\"")
+  }
+
+  /**
+   * Points the app at an agent, or at none.
+   *
+   * Applied on a button rather than per keystroke: a URL typed one character at a time is a dozen
+   * unreachable hosts in a row, and each would have logged a warning.
+   */
+  public fun applyAgentUrl() {
+    val next = agentUrlDraft.trim()
+    // Nothing saved yet: Connect on an empty list is how the first Mac is
+    // added, so it means the same thing as the Add row.
+    if (selectedHost == null) {
+      if (next.isNotBlank()) addHost(next)
+      return
+    }
+    // A new address is a different machine until proven otherwise: the token
+    // paired with the old one would only ever come back 403.
+    val changed = next != selectedHost?.url
+    updateSelected { it.copy(url = next, token = if (changed) "" else it.token) }
+    if (next.isNotBlank()) agentUrlDraft = AgentClient.normalize(next).substringAfter("://")
+    if (changed) regeneratePairCode()
+    resetHostSnapshots()
+    if (next.isBlank()) {
+      log("info", "agent · none configured, dashboards simulated")
+    } else {
+      log("info", "agent · ${AgentClient.normalize(next)}")
+    }
+  }
+
+  /**
+   * Everything derived from a host, dropped.
+   *
+   * Called whenever the app starts pointing somewhere else. The tag goes back to unreachable rather
+   * than live, because not a single byte has come back from the new address yet.
+   */
+  private fun resetHostSnapshots() {
+    // A refusal belongs to the Mac that made it.
+    pairRejected = false
+    agentMetrics = null
+    agentHost = null
+    agentError = ""
+    agentProcesses = null
+    agentVms = null
+    agentOllama = null
+    agentTools = null
+    agentAntigravity = null
+    promqlResult = null
+    agentContainers = null
+    agentK8s = null
+    agentSessions = null
+    agentAudio = null
+    gpuWatts = null
+    aneWatts = null
+    powerQueryReason = ""
+    agentClaudeSessions = null
+    agentPrs = null
+    claudeEnabled = false
+    claudeEnabledPending = null
+    claudeEnabledError = ""
+    claudeWaitSeconds = 0
+    claudePending = emptyList()
+    claudeApprovalsSupported = null
+    claudeApprovalsError = ""
+    claudeDenyingId = null
+    claudeDenyReason = ""
+    claudeDecided.clear()
+    agentAntigravitySessions = null
+    antigravitySessionsSupported = null
+    selectedAntigravityId = null
+    agentArgo = null
+    agentHomeSpeaker = null
+    agentSpeakerVolume = null
+    agentTv = null
+    tvCastDraft = ""
+    tvBusyAction = null
+    tvLastFeedback = ""
+    tvLastFeedbackTone = TerminalTone.Dim
+    tvReconnectCount = 0
+    sawUnreachable = false
+    // Everything due immediately: the new host's PRs, sessions and speaker are
+    // a different machine's, and waiting a cadence to find that out would show
+    // the old Mac's for that long.
+    lastFetched.clear()
+    if (agentUrl.isNotBlank()) {
+      // The demo lines were seeded for a phone with no Mac. Now there is one.
+      terminal.clear()
+      agentTranscript.clear()
+      logs.clear()
+    }
+    // Unreachable until proven otherwise: the tag must not say "live" before a
+    // single byte has come back from THIS host.
+    metricsSource = if (agentUrl.isBlank()) MetricsSource.Simulated else MetricsSource.Unreachable
+  }
+
+  /**
+   * Forget the agent, and the token with it.
+   *
+   * Leaving the token behind would be the worst of both: a phone with no host, holding a key that
+   * still opens it. The next pairing issues a fresh one anyway.
+   */
+  public fun forgetAgent() {
+    val current = selectedHost ?: return
+    forgetHost(current.id)
+  }
+
+  /** Whether the selected Mac has dropped out since it was last live, so "back" means something. */
+  private var sawUnreachable = false
+
+  /**
+   * One pass of the poll: whatever on screen is due, and nothing else.
+   *
+   * Metrics are the connection's heartbeat. Failure freezes the numbers where they are and says so;
+   * it does NOT resume the simulated walk, because motion over a stale reading is the most
+   * misleading thing a dashboard can do. The rest is asked for only while the Mac is answering: a
+   * pass that finds it unreachable leaves them due, so they come back with it.
+   */
+  private suspend fun pollAgent(nowMs: Long) {
+    val client = AgentClient(agentUrl, agentToken)
+    val view = pollView
+    val due = Derive.pollDue(view, refreshMillis, nowMs, lastFetched, lastVisible)
+    if (Derive.PollSource.Metrics in due) {
+      lastFetched[Derive.PollSource.Metrics] = nowMs
+      val result = runCatching {
+        // Host identity changes rarely; refresh it now and then so a renamed
+        // machine or an upgraded agent shows up without a restart.
+        if (agentHost == null || Derive.PollSource.Host in due) {
+          lastFetched[Derive.PollSource.Host] = nowMs
+          val h = client.host()
+          agentHost = h
+          if (h.macAddress.isNotBlank() && h.macAddress != agentMac) {
+            updateSelected { entry -> entry.copy(mac = h.macAddress) }
+          }
+        }
+        client.metrics()
+      }
+      result
+          .onSuccess { m ->
+            applyAgentMetrics(m)
+            if (metricsSource != MetricsSource.Live) {
+              log("ok", "agent · live from ${agentHost?.hostname ?: "host"}")
+              // Only on the transition, and only when something was there to
+              // come back FROM: a first successful poll after launch is not a
+              // recovery and does not deserve a notification.
+              if (metricsSource == MetricsSource.Unreachable && sawUnreachable) {
+                post("host", "$hostShortName is back", "the agent is answering again", Screen.Home)
+              }
+              sawUnreachable = false
+            }
+            metricsSource = MetricsSource.Live
+            agentError = ""
+          }
+          .onFailure { e ->
+            val message = e.message ?: e::class.simpleName ?: "error"
+            if (metricsSource == MetricsSource.Live) {
+              log("warn", "agent · unreachable: $message")
+              // The switch used to change only a dialog's wording. Now it does
+              // what it says: one magic packet the moment a live Mac stops
+              // answering, not one per tick -- a Mac that is off for the night
+              // does not need a packet every second.
+              if (wakeOnLan && agentMac.isNotBlank()) {
+                log("info", "power · Wake-on-LAN sent, the Mac stopped answering")
+                scope.launch { wakeHost() }
+              }
+              sawUnreachable = true
+              post("host", "$hostShortName is unreachable", message, Screen.Hosts)
+            }
+            metricsSource = MetricsSource.Unreachable
+            agentError = message
+          }
+    }
+    if (metricsSource == MetricsSource.Live) {
+      pollExtras(client, due - Derive.PollSource.Metrics - Derive.PollSource.Host, nowMs)
+      // Only once they have actually been asked for: a module opened while
+      // the Mac is not answering is still "just opened" when it comes back.
+      lastVisible = Derive.pollCadences(view, refreshMillis)
+    }
+  }
+
+  private fun applyAgentMetrics(m: AgentMetrics) {
+    agentMetrics = m
+    if (m.cpuReady) {
+      cpu.removeAt(0)
+      cpu.add(m.cpuBusyPercent.roundToInt().coerceIn(0, 100))
+    }
+    // The chart is scaled 0..100 and labelled Mb/s; both directions summed.
+    val mbps = ((m.rxBytesPerSec + m.txBytesPerSec) * 8 / 1_000_000).roundToInt()
+    net.removeAt(0)
+    net.add(mbps.coerceIn(0, NET_MAX))
+    powerDraw = m.drawWatts.roundToInt()
+  }
+
+  /**
+   * The rest of the read surface: only the [due] sources, which [Derive.pollDue] limits to what is
+   * on screen.
+   *
+   * Each is caught on its own: one endpoint failing must not blank the others, and it certainly
+   * must not knock the whole app back to "unreachable" when `/v1/metrics` answered perfectly well.
+   * A source counts as asked for when it is asked, not when it answers, so a failing endpoint is
+   * retried at its cadence rather than on every wake.
+   */
+  private suspend fun pollExtras(
+      client: AgentClient,
+      due: Set<Derive.PollSource>,
+      nowMs: Long,
+  ) {
+    for (source in Derive.PollSource.values()) {
+      if (source !in due) continue
+      // Not while a change is in flight: the read would race it and flash the old level.
+      if (source == Derive.PollSource.SpeakerVolume && speakerVolumeBusy) continue
+      lastFetched[source] = nowMs
+      when (source) {
+        Derive.PollSource.Metrics,
+        Derive.PollSource.Host -> Unit
+        Derive.PollSource.Processes ->
+            runCatching { client.processes() }.onSuccess { agentProcesses = it }
+        Derive.PollSource.Audio -> runCatching { client.audio() }.onSuccess { agentAudio = it }
+        Derive.PollSource.ClaudeSessions ->
+            runCatching { client.claudeSessions() }.onSuccess { agentClaudeSessions = it }
+        Derive.PollSource.Sessions ->
+            runCatching { client.sessions() }.onSuccess { agentSessions = it }
+        Derive.PollSource.AntigravitySessions -> pollAntigravitySessions(client)
+        Derive.PollSource.Antigravity ->
+            runCatching { client.antigravity() }.onSuccess { agentAntigravity = it }
+        // GitHub is somebody else's rate limit; Derive keeps this to a minute.
+        Derive.PollSource.Prs -> runCatching { client.prs() }.onSuccess { agentPrs = it }
+        Derive.PollSource.Argo -> runCatching { client.argocd() }.onSuccess { agentArgo = it }
+        Derive.PollSource.K8s -> runCatching { client.k8s() }.onSuccess { agentK8s = it }
+        Derive.PollSource.Vms -> runCatching { client.vms() }.onSuccess { agentVms = it }
+        Derive.PollSource.Containers ->
+            runCatching { client.containers() }.onSuccess { agentContainers = it }
+        Derive.PollSource.Ollama -> runCatching { client.ollama() }.onSuccess { agentOllama = it }
+        Derive.PollSource.HomeSpeaker ->
+            runCatching { client.homeSpeaker() }.onSuccess { agentHomeSpeaker = it }
+        Derive.PollSource.SpeakerVolume ->
+            runCatching { client.homeSpeakerVolume() }.onSuccess { agentSpeakerVolume = it }
+        Derive.PollSource.Tv -> runCatching { client.tv() }.onSuccess { agentTv = it }
+        Derive.PollSource.Tools -> runCatching { client.tools() }.onSuccess { agentTools = it }
+        // Flags on the Mac, so this changes only when the agent is restarted.
+        Derive.PollSource.Notify ->
+            runCatching { client.notifyStatus() }.onSuccess { agentNotify = it }
+        Derive.PollSource.Power -> pollPower(client)
+      }
+    }
+  }
+
+  /**
+   * GPU and Neural Engine power, in watts, if anything is exporting them.
+   *
+   * These two metrics come from `tools/ops/macos-power-agent`, which runs `powermetrics` as root
+   * and exports to Prometheus. Without that there is no way to read them at all -- which is why the
+   * failure path here sets a reason the plates print, rather than leaving a stale number in place.
+   */
+  private suspend fun pollPower(client: AgentClient) {
+    val gpuResult = runCatching { client.promql("mac_gpu_power_watts") }.getOrNull()
+    if (gpuResult == null) {
+      powerQueryReason = POWER_UNAVAILABLE
+      gpuWatts = null
+      aneWatts = null
+      return
+    }
+    if (!gpuResult.available) {
+      powerQueryReason = gpuResult.reason.ifBlank { POWER_UNAVAILABLE }
+      gpuWatts = null
+      aneWatts = null
+      return
+    }
+    powerQueryReason = if (gpuResult.firstValue == null) "no series for mac_gpu_power_watts" else ""
+    gpuWatts = gpuResult.firstValue
+    aneWatts = runCatching { client.promql("mac_ane_power_watts") }.getOrNull()?.firstValue
+  }
+
+  public fun updateTyped(value: String) {
+    typed = value
+  }
+
+  /**
+   * Types the buffer on the Mac, one keystroke at a time.
+   *
+   * There is no "send a string" in HID -- a keyboard sends one key at a time and the host assembles
+   * text -- so this walks the characters, and [HidCodes.keyFor] turns each into a press.
+   *
+   * Characters this layout cannot type are reported rather than dropped in silence. The alternative
+   * is the Mac receiving a shorter string than the user typed with nothing to explain why, which
+   * looks like data loss.
+   */
+  public fun sendTyped() {
+    val text = typed
+    typed = ""
+    if (text.isEmpty()) return
+
+    val sender = hid
+    if (sender == null) {
+      log("warn", "bluetooth · no host connected")
+      return
+    }
+
+    val keys = mutableListOf<HidAction.Key>()
+    val skipped = StringBuilder()
+    for (char in text) {
+      val key = HidCodes.keyFor(char)
+      if (key == null) skipped.append(char) else keys.add(key)
+    }
+
+    // One sequence, not a loop of sends: the transport has to hold each key
+    // down and lift it again before the next, or repeated letters vanish.
+    if (!sender.sendSequence(keys)) {
+      log("warn", "bluetooth · no host connected")
+      return
+    }
+
+    log("ok", "keys · typed ${keys.size} character${if (keys.size == 1) "" else "s"}")
+    if (skipped.isNotEmpty()) {
+      // Named explicitly: "3 characters could not be typed" is useless when
+      // you are trying to work out which ones.
+      log("warn", "keys · not on this layout: $skipped")
+    }
+  }
+
+  public fun updatePrompt(value: String) {
+    prompt = value
+  }
+
+  /**
+   * Relays the prompt to `claude -p` on the Mac and lands the user on that transcript.
+   *
+   * The "thinking…" line is a placeholder that gets REPLACED by the answer rather than followed by
+   * it: leaving it above the reply would make a finished exchange look like one still in flight.
+   * 180 seconds because that is the contract's ceiling for this kind, and a one-minute cut-off
+   * turns most real answers into a timeout.
+   */
+  public fun sendPrompt() {
+    val text = prompt.trim()
+    if (text.isEmpty()) return
+    // Held by identity, not by index. The answer's lines are appended as they
+    // arrive, so by the time the placeholder is removed everything after it has
+    // shifted -- and an index would then delete a line of the reply.
+    val placeholder = TerminalLine(" ", "thinking…", TerminalTone.Dim)
+    var first = true
+    stream(
+        what = "claude code · prompt",
+        kind = ExecKind.Claude,
+        command = text,
+        timeoutSeconds = CLAUDE_TIMEOUT_S,
+        onLine = { _, line ->
+          // The placeholder is swapped for the FIRST line rather than left
+          // above the answer: "thinking…" sitting over a finished reply reads
+          // as a turn still in flight.
+          if (first) {
+            first = false
+            agentTranscript.remove(placeholder)
+          }
+          agentTranscript.add(TerminalLine(" ", line, TerminalTone.Dim))
+        },
+        onEnd = { result ->
+          agentTranscript.remove(placeholder)
+          if (result.cancelled) {
+            agentTranscript.add(TerminalLine(" ", "stopped", TerminalTone.Warn))
+          } else if (result.exitCode != 0) {
+            agentTranscript.add(
+                TerminalLine(" ", "claude exited ${result.exitCode}", TerminalTone.Err))
+          }
+        },
+        onError = {
+          agentTranscript.remove(placeholder)
+          agentTranscript.add(TerminalLine(" ", failureText(it), TerminalTone.Err))
+          actFailed("claude code · prompt", it)
+        },
+    ) {
+      // Only once the prompt is genuinely on its way. Adding the question and
+      // a "thinking…" line for a prompt that was refused -- not paired, or
+      // something else already running -- would leave the transcript waiting
+      // for an answer that nothing is coming back with.
+      agentTranscript.add(TerminalLine("›", text, TerminalTone.Text))
+      agentTranscript.add(placeholder)
+      prompt = ""
+      openModule("claude")
+      log("info", "claude code · prompt relayed")
+    }
+  }
+
+  /** Picks the session a supplemental instruction goes to; tapping the selected one clears it. */
+  public fun selectSession(id: String) {
+    selectedSessionId = if (selectedSessionId == id) null else id
+  }
+
+  /**
+   * Send, on the Claude module.
+   *
+   * With a session selected this RESUMES that conversation -- `claude --resume <id>` on the Mac --
+   * rather than starting a fresh one, which is the whole point of the sessions list. With none
+   * selected it falls back to [sendPrompt], and the transcript says which of the two happened.
+   *
+   * `/v1/claude/resume` is not a streaming endpoint, so there is nothing to show while it runs: the
+   * "running…" line is a placeholder that the reply replaces, exactly as `thinking…` is above.
+   */
+  public fun sendModulePrompt() {
+    val session = selectedSession
+    if (session == null) {
+      sendPrompt()
+      return
+    }
+    val text = prompt.trim()
+    if (text.isEmpty()) return
+    val client = actClient("claude code · resume") ?: return
+    if (commandRunning) {
+      log("warn", "claude code · resume · \"$runningLabel\" is still running · stop it first")
+      return
+    }
+    val placeholder = TerminalLine(" ", "running…", TerminalTone.Dim)
+    agentTranscript.add(TerminalLine("›", text, TerminalTone.Text))
+    agentTranscript.add(placeholder)
+    prompt = ""
+    openModule("claude")
+    log("info", "claude code · resumed ${sessionName(session)}")
+    commandRunning = true
+    runningLabel = "resume ${sessionName(session)}"
+    scope.launch {
+      runCatching { client.claudeResume(session.sessionId, text) }
+          .onSuccess { result ->
+            agentTranscript.remove(placeholder)
+            val body = (result.stdout + result.stderr).trim()
+            if (body.isEmpty()) {
+              agentTranscript.add(TerminalLine(" ", "claude printed nothing", TerminalTone.Dim))
+            } else {
+              body.lineSequence().forEach {
+                agentTranscript.add(TerminalLine(" ", it, TerminalTone.Dim))
+              }
+            }
+            if (result.exitCode != 0) {
+              agentTranscript.add(
+                  TerminalLine(" ", "claude exited ${result.exitCode}", TerminalTone.Err))
+            }
+          }
+          .onFailure {
+            agentTranscript.remove(placeholder)
+            agentTranscript.add(TerminalLine(" ", failureText(it), TerminalTone.Err))
+            actFailed("claude code · resume", it)
+          }
+      commandRunning = false
+      runningLabel = ""
+    }
+  }
+
+  // --- pull requests ----------------------------------------------------
+
+  /**
+   * One `gh` action on one pull request.
+   *
+   * gh's own stdout is logged rather than a "done": `gh pr merge` on a blocked PR exits non-zero
+   * with a sentence explaining why, and that sentence is the only useful thing on the screen.
+   */
+  public fun prAction(pr: AgentPr, action: String) {
+    val what = "pr · ${pr.repo}#${pr.number} · ${action.replace('_', ' ')}"
+    val client = actClient(what) ?: return
+    log("info", "$what · sent")
+    scope.launch {
+      runCatching { client.prAction(pr.repo, pr.number, action) }
+          .onSuccess { result ->
+            val output =
+                Format.clip(
+                    result.output.lineSequence().firstOrNull { it.isNotBlank() }
+                        ?: (if (result.ok) "gh printed nothing" else "gh failed and said nothing"))
+            log(if (result.ok) "ok" else "warn", "$what · $output")
+            // The list is a minute stale by contract; after acting on it that
+            // is a minute of showing the state the action just changed.
+            refreshPrs()
+          }
+          .onFailure { actFailed(what, it) }
+    }
+  }
+
+  /** Asks for the PR list again now, rather than at the next 60 s tick. */
+  private fun refreshPrs() {
+    val client = AgentClient(agentUrl, agentToken)
+    scope.launch {
+      runCatching { client.prs() }
+          .onSuccess {
+            agentPrs = it
+            lastFetched[Derive.PollSource.Prs] = monotonicMs()
+          }
+    }
+  }
+
+  // --- screen peek ------------------------------------------------------
+
+  /** Opens the peek plate, and takes the first capture. Closing throws the image away. */
+  public fun togglePeek(width: Int) {
+    peekOpen = !peekOpen
+    peekRegion = Derive.PeekRegion.Full
+    if (!peekOpen) {
+      // Not kept for the next open: a stale screenshot of a Mac is exactly
+      // the kind of thing that gets read as live.
+      peekImage = null
+      peekReason = ""
+      return
+    }
+    capturePeek(width)
+  }
+
+  public fun closePeek() {
+    peekOpen = false
+    peekImage = null
+    peekReason = ""
+    peekRegion = Derive.PeekRegion.Full
+  }
+
+  /**
+   * One screenshot of the Mac's main display.
+   *
+   * [AgentUnavailableException] is caught separately and its reason shown VERBATIM: macOS refusing
+   * for want of a Screen Recording grant is the expected answer on a fresh Mac, and the remedy is a
+   * sentence the agent already wrote.
+   */
+  public fun capturePeek(width: Int) {
+    val client = actClient("screen · peek") ?: return
+    if (peekLoading) return
+    peekLoading = true
+    peekReason = ""
+    val region = peekRegion
+    scope.launch {
+      runCatching { client.screen(width, region) }
+          .onSuccess {
+            peekImage = it
+            peekReason = ""
+          }
+          .onFailure { error ->
+            peekImage = null
+            peekReason =
+                if (error is AgentUnavailableException) error.reason else failureText(error)
+            actFailed("screen · peek", error)
+          }
+      peekLoading = false
+    }
+  }
+
+  /**
+   * A pinch settled: show that part of the display, at native detail.
+   *
+   * Nothing happens for a pinch that lands where the plate already is, so a finger that wobbles
+   * without zooming does not cost a screencapture on the Mac.
+   */
+  public fun zoomPeek(region: Derive.PeekRegion, width: Int): Boolean {
+    if (region == peekRegion) return false
+    peekRegion = region
+    capturePeek(width)
+    return true
+  }
+
+  /** Double-tap: back to the whole display. True when a capture was started. */
+  public fun resetPeekZoom(width: Int): Boolean {
+    if (peekRegion.isFull) return false
+    peekRegion = Derive.PeekRegion.Full
+    capturePeek(width)
+    return true
+  }
+
+  // --- notifications ----------------------------------------------------
+
+  /** What the Mac would do with a notification, for the Hosts plate. */
+  public val notifyLine: String
+    get() {
+      val n = agentNotify ?: return "push · the agent has not said yet"
+      if (!n.configured) return "push · not configured on the Mac"
+      val topic = "push · topic ${n.topic.ifBlank { "unnamed" }}"
+      // Muted is worth saying out loud. A configured agent that sends nothing is otherwise
+      // indistinguishable from a broken one, which is the report this switch would generate.
+      return if (n.enabled) topic else "$topic · muted"
+    }
+
+  /** Whether the Mac is currently allowed to push. Drives the switch on the Hosts plate. */
+  public val notificationsEnabled: Boolean
+    get() = agentNotify?.enabled ?: true
+
+  /**
+   * Mutes or unmutes the Mac's push notifications.
+   *
+   * The reply carries the state the agent ended in, and that is what is stored: an optimistic flip
+   * would show "on" for a request the Mac refused.
+   */
+  public fun setNotifications(on: Boolean) {
+    val client = actClient("notify · switch") ?: return
+    scope.launch {
+      runCatching { client.setNotifications(on) }
+          .onSuccess {
+            agentNotify = it
+            log(if (it.enabled) "ok" else "info", "notify · ${if (it.enabled) "on" else "muted"}")
+          }
+          .onFailure { actFailed("notify · switch", it) }
+    }
+  }
+
+  /** Asks the Mac to publish one test notification. Proves the whole path, not just the flags. */
+  public fun testPush() {
+    val client = actClient("notify · test") ?: return
+    scope.launch {
+      runCatching { client.notifyTest() }
+          .onSuccess { log("ok", "notify · test published") }
+          .onFailure { actFailed("notify · test", it) }
+    }
+  }
+
+  public fun updateCommand(value: String) {
+    command = value
+  }
+
+  /** Runs the console line on the Mac through `/bin/zsh -lc`, and remembers it. */
+  public fun runCommand() {
+    val text = command.trim()
+    if (text.isEmpty()) return
+    stream(
+        what = "console · $text",
+        kind = ExecKind.Shell,
+        command = text,
+        onLine = { stream, line -> emit(terminalLine(stream, line)) },
+        onEnd = { result -> emit(exitLine(result)) },
+        onError = { emitFailure("console", it) },
+    ) {
+      emit(TerminalLine("$", text, TerminalTone.Text))
+      command = ""
+      remember(text)
+    }
+  }
+
+  /**
+   * Runs a command and shows its output as it arrives.
+   *
+   * The whole reason `/v1/exec/stream` exists on the agent: `/v1/exec` answers once, at the end, so
+   * a four-minute build was four minutes of a screen that could not distinguish "working" from
+   * "hung". [started] runs only if the command is actually going to be sent -- it is what prints
+   * the `$ command` line and clears the input, and doing that for a command that was refused
+   * because the phone is not paired would leave a prompt on screen for something that never ran.
+   */
+  private fun stream(
+      what: String,
+      kind: ExecKind,
+      command: String,
+      timeoutSeconds: Int = 0,
+      onLine: (String, String) -> Unit,
+      onEnd: (ExecResult) -> Unit,
+      onError: (Throwable) -> Unit,
+      /**
+       * What to stream, when it is not `/v1/exec/stream` running [command] as [kind]: Antigravity's
+       * prompts use the same line-by-line machinery on their own endpoint.
+       */
+      run: (suspend (AgentClient, ExecStreamHandle, (String, String) -> Unit) -> ExecResult)? =
+          null,
+      started: () -> Unit,
+  ) {
+    val client = actClient(what) ?: return
+    // One at a time, and said out loud. Two streams into one terminal would
+    // interleave line by line with nothing to say which was which.
+    if (commandRunning) {
+      log("warn", "$what · \"$runningLabel\" is still running · stop it first")
+      return
+    }
+    started()
+    val handle = ExecStreamHandle()
+    runningHandle = handle
+    commandRunning = true
+    runningLabel = command.take(RUNNING_LABEL_MAX)
+    scope.launch {
+      // The callback lands on an IO thread and these lists are read by
+      // Compose; the hop back is not optional.
+      val relay = { stream: String, text: String -> scope.launch { onLine(stream, text) } }
+      runCatching {
+            if (run != null) run(client, handle) { s, t -> relay(s, t) }
+            else client.execStream(kind, command, timeoutSeconds, handle) { s, t -> relay(s, t) }
+          }
+          .onSuccess { result ->
+            onEnd(result)
+            notifyFinished(command, result)
+          }
+          .onFailure { onError(it) }
+      commandRunning = false
+      runningLabel = ""
+      runningHandle = null
+    }
+  }
+
+  /**
+   * Hangs up on the running command.
+   *
+   * Closing the connection IS the cancellation: the agent kills the process group when the phone
+   * disconnects, so there is no "please stop" for the Mac to ignore.
+   */
+  public fun stopCommand() {
+    val handle = runningHandle
+    if (handle == null) {
+      log("warn", "console · nothing is running")
+      return
+    }
+    handle.cancel()
+    log("warn", "console · stopped \"$runningLabel\"")
+  }
+
+  /** One streamed line, coloured by the pipe it came from. */
+  private fun terminalLine(stream: String, text: String): TerminalLine =
+      TerminalLine(" ", text, if (stream == "stderr") TerminalTone.Warn else TerminalTone.Text)
+
+  /**
+   * How a streamed command ended.
+   *
+   * `exit 0` is printed even on success: a command that produced no output and one that failed look
+   * identical without it. A cancelled command says so instead of inventing a code.
+   */
+  private fun exitLine(result: ExecResult): TerminalLine =
+      if (result.cancelled) TerminalLine(" ", "stopped", TerminalTone.Warn)
+      else
+          TerminalLine(
+              " ",
+              "exit ${result.exitCode}",
+              if (result.exitCode == 0) TerminalTone.Ok else TerminalTone.Err,
+          )
+
+  /** Newest first, no duplicates, capped by [Persistence]. */
+  private fun remember(command: String) {
+    ranCommands.remove(command)
+    ranCommands.add(0, command)
+    while (ranCommands.size > RECENT_COMMANDS) ranCommands.removeAt(ranCommands.lastIndex)
+    persistence.recentCommands = ranCommands.toList()
+  }
+
+  public fun toggleAgentPaused() {
+    agentPaused = !agentPaused
+  }
+
+  /** Phone clipboard to Mac clipboard. */
+  public fun pushClipboard() {
+    val client = actClient("clipboard · push") ?: return
+    val text = phoneClipboard?.read()
+    if (text.isNullOrEmpty()) {
+      log("warn", "clipboard · nothing on the phone to push")
+      return
+    }
+    scope.launch {
+      runCatching { client.setClipboard(text) }
+          .onSuccess {
+            clipboard = text
+            log("ok", "clipboard · pushed ${text.length} characters")
+          }
+          .onFailure { actFailed("clipboard · push", it) }
+    }
+  }
+
+  /** Mac clipboard to phone clipboard, and onto the plate that shows it. */
+  public fun pullClipboard() {
+    val client = actClient("clipboard · pull") ?: return
+    scope.launch {
+      runCatching { client.clipboard() }
+          .onSuccess { text ->
+            clipboard = text
+            phoneClipboard?.write(text)
+            log(
+                if (phoneClipboard == null) "warn" else "ok",
+                if (phoneClipboard == null)
+                    "clipboard · pulled, but this build has no phone clipboard"
+                else "clipboard · pulled ${text.length} characters",
+            )
+          }
+          .onFailure { actFailed("clipboard · pull", it) }
+    }
+  }
+
+  /** Ctrl+Cmd+Q. Distinct from Sleep: this demands a password on return, sleep does not. */
+  public fun lock() {
+    log("ok", "power · screen locked")
+    sendHid(HidAction.LockScreen)
+  }
+
+  public fun openDialog(kind: DialogKind) {
+    dialog = kind
+    confirmText = ""
+  }
+
+  public fun updateConfirmText(value: String) {
+    confirmText = value
+  }
+
+  public fun closeDialog() {
+    dialog = null
+  }
+
+  public fun confirmDialog() {
+    if (dialogBlocked) return
+    // Read once into a local: `dialog` is a Compose state property, which
+    // cannot be smart-cast, and the branches below need the target the dialog
+    // was opened for.
+    when (val open = dialog) {
+      // The one power action a keyboard can actually perform. Restart and
+      // Halt below stay mocked: HID cannot express them, and pretending
+      // otherwise would be worse than an honest no-op.
+      DialogKind.Sleep -> {
+        log("info", "power · $hostShortName sleeping")
+        // Ctrl+Shift+Power on the KEYBOARD page. Consumer 0x30 -- what the
+        // ESP32 sends over BLE -- is enumerated by macOS and then ignored over
+        // Bluetooth Classic. Ctrl+Cmd+Q was the first workaround and does work,
+        // but it LOCKS the Mac; this sleeps the display and leaves the session
+        // alone, which is what was actually asked for.
+        sendHid(HidAction.DisplaySleepChord)
+      }
+      // Real now, and the one action here that HID cannot express: a keyboard
+      // has no "restart", so this is the agent or nothing.
+      DialogKind.Restart -> {
+        val client = actClient("power · restart")
+        if (client != null) {
+          log("warn", "power · restart issued")
+          scope.launch {
+            runCatching { client.power("restart") }.onFailure { actFailed("power · restart", it) }
+          }
+        }
+      }
+      DialogKind.Halt -> {
+        agentPaused = true
+        log("warn", "claude code · halted")
+      }
+      // Merging is the one PR action that cannot be undone from a phone, so
+      // it is the one that comes through here.
+      is DialogKind.MergePr -> {
+        val target = open
+        val what = "pr · ${target.repo}#${target.number} · merge"
+        val client = actClient(what)
+        if (client != null) {
+          log("warn", "$what · sent")
+          scope.launch {
+            runCatching { client.prAction(target.repo, target.number, "merge") }
+                .onSuccess { result ->
+                  val output =
+                      Format.clip(
+                          result.output.lineSequence().firstOrNull { it.isNotBlank() }
+                              ?: (if (result.ok) "merged" else "gh failed and said nothing"))
+                  log(if (result.ok) "ok" else "warn", "$what · $output")
+                  refreshPrs()
+                }
+                .onFailure { actFailed(what, it) }
+          }
+        }
+      }
+      is DialogKind.EnableClaudePrompts -> sendClaudePermissionsEnabled(true)
+      is DialogKind.PairFromQr -> pairFromQr(open.link)
+      is DialogKind.SyncApp -> {
+        val target = open
+        val what = "argocd · ${target.namespace}/${target.name} · sync"
+        val client = actClient(what)
+        if (client != null) {
+          log("warn", "$what · sent")
+          scope.launch {
+            runCatching { client.argoSync(target.name, target.namespace) }
+                .onSuccess { result ->
+                  val output =
+                      Format.clip(
+                          result.output.lineSequence().firstOrNull { it.isNotBlank() }
+                              ?: (if (result.ok) "patched" else "kubectl said nothing"))
+                  log(if (result.ok) "ok" else "warn", "$what · $output")
+                }
+                .onFailure { actFailed(what, it) }
+          }
+        }
+      }
+      null -> Unit
+    }
+    dialog = null
+  }
+
+  public fun updatePromql(value: String) {
+    promql = value
+  }
+
+  /**
+   * Runs the query through the agent's Prometheus proxy.
+   *
+   * The panel reports what came back -- result type, how many series, the first value -- and not a
+   * chart, because there is no chart here to draw one in. When no Prometheus is configured the
+   * agent says so and that reason goes on screen verbatim.
+   */
+  public fun runPromql() {
+    if (agentUrl.isBlank()) {
+      promqlStatus = "no agent configured"
+      return
+    }
+    val query = promql.trim()
+    if (query.isEmpty()) return
+    val client = AgentClient(agentUrl, agentToken)
+    promqlStatus = "querying…"
+    scope.launch {
+      runCatching { client.promql(query) }
+          .onSuccess { result ->
+            promqlResult = result
+            promqlStatus =
+                if (!result.available) {
+                  result.reason.ifBlank { "no result, and no reason given" }
+                } else {
+                  val value = result.firstValue?.let { " · first ${"%.4g".format(it)}" }.orEmpty()
+                  "${result.resultType.ifBlank { "result" }} · " +
+                      "${result.seriesCount} series$value"
+                }
+            log("ok", "promql · query ran")
+          }
+          .onFailure {
+            promqlStatus = failureText(it)
+            log("warn", "promql · ${failureText(it)}")
+          }
+    }
+  }
+
+  /**
+   * Sends a real Wake-on-LAN packet, then waits for the agent to answer.
+   *
+   * Broadcast twice: to the subnet-wide 255.255.255.255, and directly at the agent's own address.
+   * Neither is reliable on its own -- the broadcast is what wakes a machine that has no IP yet, and
+   * some networks drop it, in which case the ARP cache entry for the unicast one is what carries
+   * the packet to the right switch port.
+   *
+   * The old version waited 1.8 seconds and declared victory. This one asks `/healthz` until it
+   * answers, so "Connected" means the Mac replied and not that enough time has passed.
+   */
+  public suspend fun wakeHost() {
+    val mac = agentMac
+    if (mac.isBlank()) {
+      log("warn", "power · no MAC address known, so there is nothing to wake")
+      return
+    }
+    val packet = WakeOnLan.packetFor(mac)
+    if (packet == null) {
+      log("warn", "power · \"$mac\" is not a MAC address")
+      return
+    }
+    val sent = withContext(Dispatchers.IO) { broadcast(packet) }
+    if (!sent) {
+      log(
+          "warn",
+          "power · the magic packet could not be sent · ${wakeFailure.ifBlank { "no reason given" }}")
+      return
+    }
+    log("info", "power · magic packet sent to $mac")
+    if (agentUrl.isBlank()) return
+    val client = AgentClient(agentUrl)
+    val deadline = WAKE_TIMEOUT_MS / WAKE_PROBE_MS
+    repeat(deadline.toInt()) {
+      delay(WAKE_PROBE_MS)
+      if (client.healthy()) {
+        connection = Connection.Connected
+        log("ok", "${agentHost?.hostname ?: hostShortName} · back online")
+        return
+      }
+    }
+    log("warn", "power · no answer within ${WAKE_TIMEOUT_MS / 1000} s")
+  }
+
+  /** Why the last magic packet did not leave the phone, for the log line that says it did not. */
+  private var wakeFailure: String = ""
+
+  /** True when at least one of the two datagrams left the phone. */
+  private fun broadcast(packet: ByteArray): Boolean {
+    val targets = buildList {
+      add("255.255.255.255")
+      if (agentUrl.isNotBlank()) add(agentHostLabel().substringBefore(':'))
+    }
+    var sent = false
+    wakeFailure = ""
+    runCatching {
+          DatagramSocket().use { socket ->
+            socket.broadcast = true
+            targets.forEach { target ->
+              runCatching {
+                    val address = InetAddress.getByName(target)
+                    socket.send(DatagramPacket(packet, packet.size, address, WakeOnLan.PORT))
+                  }
+                  .onSuccess { sent = true }
+                  // Kept, not swallowed: "could not be sent" with no reason
+                  // is indistinguishable from a bug. On the Fold it was the
+                  // phone's own network dropping mid-fold, and the message
+                  // said so once it was allowed to.
+                  .onFailure { wakeFailure = failureText(it) }
+            }
+          }
+        }
+        .onFailure { wakeFailure = failureText(it) }
+    return sent
+  }
+
+  /**
+   * Retry is a real poll, now, not a log line pretending to be one. The result -- live or still
+   * unreachable -- lands through the same path a scheduled tick uses, so the tag and the numbers
+   * say whatever is actually true.
+   */
+  public fun retryHost() {
+    if (agentUrl.isBlank()) {
+      log("warn", "host · no agent configured to retry")
+      return
+    }
+    log("info", "host · retrying ${AgentClient.normalize(agentUrl)}")
+    // Through the loop rather than beside it: two polls racing would ask for
+    // everything twice. Clearing the clock makes all of it due now.
+    lastFetched.clear()
+    pollWake.trySend(Unit)
+  }
+
+  // --- Claude Code permission prompts (API v1.6) -----------------------------
+
+  /**
+   * Asks the Mac for pending Claude prompts every [CLAUDE_POLL_MS] until cancelled.
+   *
+   * A loop of its own rather than a step of [runMetrics]: that one runs at the Hosts screen's
+   * refresh setting, which can be 30 s, and a prompt the Mac holds for two minutes cannot wait a
+   * quarter of that to appear. Two seconds is quick enough to feel like a notification and slow
+   * enough to cost the Mac nothing (the endpoint reads memory, it does not shell out).
+   *
+   * Only while someone is looking, the Mac is live and the phone is paired. The endpoint is act
+   * tier, so unpaired it would only ever answer 401 -- the dashboard says "pair" instead. In the
+   * background the agent's ntfy notification is what reaches the person, so polling there would be
+   * battery spent on a screen nobody sees.
+   */
+  public suspend fun runClaudePermissions() {
+    while (true) {
+      delay(CLAUDE_POLL_MS)
+      if (!foreground || !isLive || !paired || agentUrl.isBlank()) continue
+      if (claudeApprovalsSupported == false) {
+        // An older agent: ask again now and then, not every two seconds.
+        if (++claudeUnsupportedSkips < CLAUDE_RECHECK_POLLS) continue
+        claudeUnsupportedSkips = 0
+      }
+      pollClaudePermissions(AgentClient(agentUrl, agentToken))
+    }
+  }
+
+  private suspend fun pollClaudePermissions(client: AgentClient) {
+    runCatching { client.claudePermissions() }
+        .onSuccess { reply ->
+          claudeApprovalsSupported = true
+          claudeApprovalsError = ""
+          // Not while a change is in flight: this read may have left before
+          // it, and would flick the toggle back for a poll.
+          if (claudeEnabledPending == null) claudeEnabled = reply.enabled
+          claudeWaitSeconds = reply.waitSeconds
+          val listed = reply.pending.map { it.id }.toSet()
+          claudeDecided.retainAll(listed)
+          claudePending = reply.pending.filterNot { it.id in claudeDecided }
+          if (claudeDenyingId != null && claudePending.none { it.id == claudeDenyingId }) {
+            // Answered on the Mac, or expired, while the reason was being typed.
+            claudeDenyingId = null
+            claudeDenyReason = ""
+          }
+        }
+        .onFailure { e ->
+          when (e) {
+            is AgentNotFoundException -> {
+              if (claudeApprovalsSupported != false) {
+                log("info", "claude · this Mac agent predates phone approvals")
+              }
+              claudeApprovalsSupported = false
+              claudePending = emptyList()
+              claudeApprovalsError = ""
+            }
+            // A rejected token: the same remedy as any act, which drops it and
+            // puts the pairing code back on screen.
+            is AgentAuthException -> {
+              claudePending = emptyList()
+              actFailed("claude · prompts", e)
+            }
+            // Kept rather than blanked: a Mac that missed one poll still holds
+            // those prompts, and the countdown says how long they have left.
+            else -> claudeApprovalsError = failureText(e)
+          }
+        }
+  }
+
+  /**
+   * The "Answer Claude prompts on this phone" toggle.
+   *
+   * On goes through a confirmation first: it rewrites Claude Code's own settings on the Mac, for
+   * every session there, not just this phone's view of it. Off needs none -- it removes what On
+   * added and puts the Mac back the way it was.
+   */
+  public fun setClaudePermissionsEnabled(on: Boolean) {
+    if (claudeEnabledPending != null) return
+    if (on) openDialog(DialogKind.EnableClaudePrompts(claudeWaitSeconds))
+    else sendClaudePermissionsEnabled(false)
+  }
+
+  /**
+   * Asks the Mac to install or remove the hook. The toggle shows the Mac's answer, not the tap: a
+   * request that fails leaves it where the Mac has it, with the Mac's reason under it.
+   */
+  private fun sendClaudePermissionsEnabled(on: Boolean) {
+    val what = if (on) "claude · hook install" else "claude · hook removal"
+    val client = actClient(what) ?: return
+    claudeEnabledPending = on
+    claudeEnabledError = ""
+    scope.launch {
+      runCatching { client.setClaudePermissionsEnabled(on) }
+          .onSuccess { hook ->
+            claudeEnabled = hook.enabled
+            val file = hook.settingsPath.ifBlank { "Claude Code settings" }
+            log(
+                "ok",
+                if (hook.enabled) "claude · prompts now come to this phone first · hook in $file"
+                else "claude · prompts back on the Mac · hook removed from $file")
+            if (!hook.enabled) claudePending = emptyList()
+          }
+          .onFailure { e ->
+            when (e) {
+              is AgentNotFoundException -> {
+                claudeApprovalsSupported = false
+                log("warn", "$what · update the Mac agent to answer prompts here")
+              }
+              // The Mac's own words, e.g. settings.json is not valid JSON: the
+              // one thing that tells the person what to fix.
+              is AgentRequestException -> {
+                claudeEnabledError = e.detail.ifBlank { failureText(e) }
+                log("warn", "$what · ${failureText(e)}")
+              }
+              else -> {
+                claudeEnabledError = failureText(e)
+                actFailed(what, e)
+              }
+            }
+          }
+      claudeEnabledPending = null
+    }
+  }
+
+  /** Approve: Claude Code runs the tool as if the dialog on the Mac had been answered Yes. */
+  public fun approveClaude(id: String) {
+    decideClaude(id, allow = true, message = "")
+  }
+
+  /** Deny, with an optional reason Claude Code reads back to the model. */
+  public fun denyClaude(id: String, message: String) {
+    decideClaude(id, allow = false, message = message)
+  }
+
+  /** Opens the reason field under a prompt's Deny, or closes it on a second tap. */
+  public fun startDenyClaude(id: String) {
+    if (claudeDenyingId == id) {
+      cancelDenyClaude()
+      return
+    }
+    claudeDenyingId = id
+    claudeDenyReason = ""
+  }
+
+  public fun cancelDenyClaude() {
+    claudeDenyingId = null
+    claudeDenyReason = ""
+  }
+
+  public fun updateClaudeDenyReason(value: String) {
+    // One line: the hook passes it to Claude Code as a single message.
+    claudeDenyReason = value.replace('\n', ' ').take(CLAUDE_DENY_MAX)
+  }
+
+  /**
+   * Sends one answer, taking the card off screen at once.
+   *
+   * Optimistic because the answer is already final from the person's side, and a card that stays up
+   * for the round trip invites a second tap. A 404 is not a failure to retry: the prompt was
+   * answered on the Mac or ran out of time, and saying exactly that is the whole response. Any
+   * other failure puts the card back, because the prompt is still waiting and nobody has answered
+   * it.
+   */
+  private fun decideClaude(id: String, allow: Boolean, message: String) {
+    val item = claudePending.firstOrNull { it.id == id } ?: return
+    val what = "claude · ${if (allow) "allow" else "deny"} ${item.tool}"
+    val client = actClient(what) ?: return
+    claudeDecided += id
+    claudePending = claudePending.filterNot { it.id == id }
+    if (claudeDenyingId == id) cancelDenyClaude()
+    scope.launch {
+      runCatching { client.decideClaudePermission(id, allow, message) }
+          .onSuccess { log("ok", Derive.claudeDecisionLog(allow, item.tool, item.project)) }
+          .onFailure { e ->
+            if (e is AgentNotFoundException) {
+              log("warn", "$what · already answered on the Mac or expired")
+            } else {
+              claudeDecided -= id
+              if (claudePending.none { it.id == id }) {
+                claudePending = (claudePending + item).sortedBy { it.expiresAtMs }
+              }
+              actFailed(what, e)
+            }
+          }
+    }
+  }
+
+  /**
+   * The prompts' source when it can be had, else null.
+   *
+   * Null sends [Derive.claudeWaitingCount] back to the transcript guess: an agent without the
+   * endpoint, a phone without a token, a Mac not answering -- and the hook not installed. With the
+   * hook off, prompts go straight to the Mac's dialog and the agent never sees them, so its empty
+   * list would be a confident 0 over sessions that may well be blocked. With the hook on, 0 is a
+   * real 0.
+   */
+  private val claudeRealPending: Int?
+    get() =
+        if (isLive && paired && claudeApprovalsSupported == true && claudeEnabled) {
+          claudePending.size
+        } else {
+          null
+        }
+
+  /**
+   * The one line the approvals section shows instead of its controls, or null when they work.
+   *
+   * Each is a reason the person can act on or at least understand; a switch that silently does
+   * nothing would be the worst answer.
+   */
+  public val claudeApprovalsNotice: String?
+    get() =
+        when {
+          agentUrl.isBlank() -> "Connect a Mac agent to answer Claude prompts here."
+          !paired -> "Pair this phone to answer Claude prompts here."
+          !isLive -> "The Mac is not answering. Prompts show on the Mac as usual."
+          claudeApprovalsSupported == false -> "Update the Mac agent to answer Claude prompts here."
+          claudeApprovalsSupported == null -> "Asking the Mac agent…"
+          else -> null
+        }
+
+  /** Called by the activity: whether anyone is actually looking at this. */
+  public fun onForeground(value: Boolean) {
+    foreground = value
+  }
+
+  // --- the phone bridge -------------------------------------------------
+
+  /** Whether the bridge can be operated at all: false in previews and tests. */
+  public val bridgeAvailable: Boolean
+    get() = bridge != null
+
+  /** The trust window in words: "closed", or how long is left. */
+  public val trustRemaining: String
+    get() = BridgePolicy.trustRemaining(trustUntil, bridgeNowMs)
+
+  public val trustOpen: Boolean
+    get() = BridgePolicy.trustOpen(trustUntil, bridgeNowMs)
+
+  /**
+   * The bridge told us something. Called on the main thread by the activity's adapter.
+   *
+   * One call carrying everything rather than five setters: the link state, the window and the audit
+   * trail change together when a tool runs, and a UI that learned about them one at a time would
+   * paint an approval that had already been answered.
+   */
+  public fun onBridgeStatus(status: BridgeStatus) {
+    val refusedNow =
+        !status.linked &&
+            status.link != bridgeLinkStatus &&
+            status.link.startsWith(LINK_REFUSED_PREFIX)
+    bridgeEnabled = status.enabled
+    bridgeLinked = status.linked
+    bridgeLinkStatus = status.link
+    // The link is act tier. A 401/403 on it is the Mac refusing this phone's
+    // token like any other act, so it gets the same remedy -- dropped token,
+    // fresh code, the banner -- instead of only a dim line on one plate. On the
+    // transition only: after a re-pair the service keeps saying this until its
+    // next attempt, and that must not throw the NEW token away.
+    if (refusedNow) actFailed("bridge · link", AgentAuthException(status.link))
+    trustUntil = status.trustUntil
+    pendingApproval = status.pending
+    bridgeAudit = status.audit
+    bridgeNowMs = System.currentTimeMillis()
+  }
+
+  /** Re-reads the permission rows. Cheap, and the answer changes while the app is in the back. */
+  public fun refreshBridgePermissions() {
+    bridgePermissions = bridge?.permissions() ?: emptyList()
+    bridgeNowMs = System.currentTimeMillis()
+  }
+
+  /** The switch on the Hosts plate. */
+  public fun updateBridgeEnabled(value: Boolean) {
+    val control = bridge
+    if (control == null) {
+      log("warn", "bridge · not available in this build")
+      return
+    }
+    bridgeEnabled = value
+    persistence.bridgeEnabled = value
+    control.setEnabled(value)
+    log(if (value) "ok" else "info", "bridge · ${if (value) "started" else "stopped"}")
+  }
+
+  /**
+   * "Reconnect" / "Retry": dial now rather than wait out the backoff, starting the service if it
+   * stopped. The answer arrives through [onBridgeStatus] like any other.
+   */
+  public fun reconnectBridge() {
+    val control = bridge
+    if (control == null) {
+      log("warn", "bridge · not available in this build")
+      return
+    }
+    if (!bridgeEnabled) {
+      bridgeEnabled = true
+      persistence.bridgeEnabled = true
+    }
+    control.reconnect()
+    log("info", "bridge · reconnecting to $hostShortName")
+  }
+
+  /**
+   * "Pair now": Hosts, scrolled to the pairing plate, with a code that has not expired -- a banner
+   * that lands on "expires in 0:00" would be one more dead end.
+   */
+  public fun openPairing() {
+    screen = Screen.Hosts
+    if (pairMillisLeft <= 0) regeneratePairCode()
+    pairFocusRequest++
+  }
+
+  /** "Trust agents for 1 hour". */
+  public fun trustAgents() {
+    bridge?.trustForAnHour()
+    log("warn", "bridge · agents trusted for 1 hour")
+  }
+
+  /** "End trust", for when an hour turns out to have been optimistic. */
+  public fun endTrust() {
+    bridge?.endTrust()
+    log("ok", "bridge · trust ended")
+  }
+
+  public fun approvePending() {
+    val question = pendingApproval?.question.orEmpty()
+    bridge?.answer(true)
+    log("warn", "bridge · approved · $question")
+  }
+
+  public fun denyPending() {
+    val question = pendingApproval?.question.orEmpty()
+    bridge?.answer(false)
+    log("ok", "bridge · denied · $question")
+  }
+
+  /** The Grant button on a permission row. */
+  public fun grantBridgePermission(id: String) {
+    bridge?.grant(id)
+  }
+
+  /**
+   * A phone-local notification, or nothing.
+   *
+   * Nothing when there is no notifier (previews and tests). The deep link is what makes a
+   * notification worth tapping: it opens the screen the message is about rather than wherever the
+   * app happened to be.
+   */
+  private fun post(id: String, title: String, body: String, screen: Screen) {
+    notifier?.notify(id, title, body, DeepLink.uriFor(screen.name.lowercase(Locale.ROOT)))
+  }
+
+  /**
+   * Tells the user a command finished, but only if they were not watching.
+   *
+   * A notification for output that is already on screen in front of them is noise, and noise is how
+   * a notification channel gets turned off for the one message that mattered.
+   */
+  private fun notifyFinished(command: String, result: ExecResult) {
+    if (foreground || result.cancelled) return
+    post(
+        id = "exec",
+        title = "Command finished · exit ${result.exitCode}",
+        body = command.take(NOTIFY_BODY_MAX),
+        screen = Screen.Console,
+    )
+  }
+
+  /**
+   * A Quick Settings tile firing while the app was not running.
+   *
+   * The tile can be tapped from the lock screen, seconds before Bluetooth has finished connecting,
+   * so this waits rather than failing instantly -- and when the wait runs out it says which of the
+   * three link states it gave up in, because "nothing happened" is the one answer that teaches
+   * nobody anything.
+   */
+  public fun runTileAction(action: HidAction) {
+    val label = desktopLabel(action)
+    scope.launch {
+      repeat((TILE_HID_WAIT_MS / TILE_HID_POLL_MS).toInt()) {
+        if (hidLink == HidLinkState.Connected) {
+          sendHid(action)
+          log("ok", "tile · $label sent")
+          return@launch
+        }
+        delay(TILE_HID_POLL_MS)
+      }
+      log(
+          "warn",
+          "tile · $label not sent · bluetooth is $hidLinkWord after " +
+              "${TILE_HID_WAIT_MS / 1000} s",
+      )
+    }
+  }
+
+  private val hidLinkWord: String
+    get() =
+        when (hidLink) {
+          HidLinkState.Connected -> "connected"
+          HidLinkState.WaitingForHost -> "waiting for the Mac to connect"
+          HidLinkState.Unavailable -> "unavailable (not paired, or permission not granted)"
+        }
+
+  /**
+   * The phone has no speech recognizer.
+   *
+   * Logged rather than swallowed: a mic button that does nothing when pressed is indistinguishable
+   * from one that is broken, and the remedy (install a recognizer, or use the keyboard's own mic)
+   * is not one the app can guess at.
+   */
+  public fun noteNoSpeechRecognizer() {
+    log("warn", "dictation · no speech recognizer on this phone")
+  }
+
+  // --- helpers ----------------------------------------------------------
+
+  /**
+   * A client for an act endpoint, or null with the reason logged.
+   *
+   * The single gate every acting button goes through. Without a token the contract's act half is
+   * closed to us, and the honest response is to say "not paired" once in the event stream rather
+   * than to fire a request that will come back 401 and be swallowed.
+   */
+  private fun actClient(what: String): AgentClient? {
+    if (agentUrl.isBlank()) {
+      log("warn", "$what · no agent configured")
+      return null
+    }
+    if (!paired) {
+      log("warn", "$what · ${Derive.notPairedText(hostShortName)}")
+      return null
+    }
+    return AgentClient(agentUrl, agentToken)
+  }
+
+  private fun emitFailure(what: String, error: Throwable) {
+    emit(TerminalLine(" ", failureText(error), TerminalTone.Err))
+    actFailed(what, error)
+  }
+
+  /**
+   * One act failed. Logs it, and throws the token away if that is what went wrong.
+   *
+   * Keeping a rejected token would wedge the app permanently: [paired] would stay true, so the
+   * pairing loop would never run again, and every button would keep failing with a 403 that nothing
+   * could clear short of Forget. Dropping it puts the code back on screen and the loop back to
+   * work.
+   */
+  private fun actFailed(what: String, error: Throwable) {
+    if (error is AgentAuthException && paired) {
+      updateSelected { it.copy(token = "") }
+      // The banner now says the Mac refused this phone, on every screen that
+      // has controls, instead of the toggle quietly snapping back.
+      pairRejected = true
+      regeneratePairCode()
+      log("warn", "$what · token rejected, pair again with the new code")
+      return
+    }
+    log("warn", "$what · ${failureText(error)}")
+  }
+
+  /** An auth failure has a remedy and says so; everything else is the Mac not answering. */
+  /**
+   * One line a status row can hold. A JSON parse error quotes the whole document it choked on; 64
+   * KiB of that as a status label pushed the entire dashboard off the bottom of the screen.
+   */
+  private fun failureText(error: Throwable): String {
+    if (error is AgentAuthException) return Derive.notPairedText(hostShortName)
+    val text = (error.message ?: error::class.simpleName ?: "error").lineSequence().first()
+    return if (text.length > FAILURE_TEXT_MAX) text.take(FAILURE_TEXT_MAX) + "…" else text
+  }
+
+  private fun emit(vararg lines: TerminalLine) {
+    terminal.addAll(lines)
+    while (terminal.size > TERMINAL_LIMIT) {
+      terminal.removeAt(0)
+    }
+  }
+
+  private fun log(level: String, message: String) {
+    logs.add(0, LogEntry(Clock.now(), level, message))
+    while (logs.size > LOG_LIMIT) {
+      logs.removeAt(logs.lastIndex)
+    }
+  }
+
+  private fun plural(count: Int): String = if (count == 1) "" else "s"
+
+  private companion object {
+    /** How `AgentAuthException` words a refusal, and so how the bridge's link status reads one. */
+    const val LINK_REFUSED_PREFIX = "not paired (HTTP"
+
+    const val POINTER_HINT = "drag · tap · 2-finger scroll · hold to drag · 3-finger swipe"
+
+    const val PAIR_TTL_MS = 5 * 60 * 1000L
+    const val PAIR_CODE_BOUND = 1_000_000
+    const val CLAUDE_TIMEOUT_S = 180
+    const val RECENT_COMMANDS = 20
+    const val NANOS_PER_MS = 1_000_000L
+    const val RUNNING_LABEL_MAX = 40
+    const val NOTIFY_BODY_MAX = 80
+
+    /** How long a tile waits for the Bluetooth link before saying why it gave up. */
+    const val TILE_HID_WAIT_MS = 5_000L
+    const val TILE_HID_POLL_MS = 250L
+    const val MIB = 1024.0 * 1024.0
+
+    /** The floor on the Hosts screen's refresh setting - a second is a second. */
+    const val MIN_POLL_MS = 1000L
+
+    /** How often pending Claude prompts are read while the app is on screen. */
+    const val CLAUDE_POLL_MS = 2000L
+
+    /** After a 404, ask again every this many polls (a minute) in case the agent was upgraded. */
+    const val CLAUDE_RECHECK_POLLS = 30
+
+    /** The agent's cap on a deny message. */
+    const val CLAUDE_DENY_MAX = 300
+    const val WAKE_TIMEOUT_MS = 60_000L
+    const val WAKE_PROBE_MS = 2000L
+    const val POWER_UNAVAILABLE = "n/a · needs powermetrics (root) or Prometheus"
+
+    /** Six digits, split for reading aloud. The wire form strips the space back out. */
+    fun formatPairCode(value: Int): String {
+      val digits = value.toString().padStart(6, '0')
+      return "${digits.take(3)} ${digits.drop(3)}"
+    }
+
+    const val SERIES_ROWS = 12
+
+    /** How many series the Mac screen's panel shows before it stops. */
+    const val PANEL_ROWS = 8
+    const val FAILURE_TEXT_MAX = 120
+    const val SECONDS_PER_DAY = 86_400L
+    const val BATTERY_WARN_PERCENT = 20
+    const val MEMORY_SEGMENTS = 16
+
+    /** Where the bar turns amber. Above this the machine is swapping soon. */
+    const val MEMORY_WARN_PERCENT = 75
+    const val DOWN_FACTOR = 1.2
+    const val UP_FACTOR = 0.3
+    const val CPU_STEP = 16
+    const val CPU_MIN = 6
+    const val CPU_MAX = 96
+    const val NET_STEP = 30
+    const val NET_MIN = 4
+    const val NET_MAX = 100
+    const val GPU_STEP = 8
+    const val GPU_MIN = 4
+    const val GPU_MAX = 98
+    const val ANE_STEP = 6
+    const val ANE_MAX = 90
+    const val TEMP_STEP = 2
+    const val TEMP_MIN = 38
+    const val TEMP_MAX = 92
+    const val FAN_BASE = 900
+    const val FAN_PER_DEGREE = 14
+    const val DRAW_BASE = 12
+    const val DRAW_DIVISOR = 3
+  }
+}
+
+/** The copy and behaviour of one confirmation dialog. */
+public data class DialogSpec(
+    val kicker: String,
+    val destructive: Boolean,
+    val title: String,
+    val body: String,
+    val action: String,
+    val word: String?,
+) {
+  public companion object {
+    /**
+     * Builds the dialog's copy.
+     *
+     * The typed confirmation is skipped entirely when the Hosts switch is off, which is why
+     * [confirmDestructive] reaches in here rather than being checked at the call site.
+     */
+    public fun of(
+        kind: DialogKind,
+        wakeOnLan: Boolean,
+        confirmDestructive: Boolean,
+        host: String,
+    ): DialogSpec =
+        when (kind) {
+          DialogKind.Sleep ->
+              DialogSpec(
+                  kicker = "Power",
+                  destructive = false,
+                  title = "Sleep $host?",
+                  body =
+                      "Displays off, SSH session kept alive by Tailscale. " +
+                          "Wake on LAN is ${if (wakeOnLan) "on" else "off"}.",
+                  action = "Sleep",
+                  word = null,
+              )
+          DialogKind.Restart ->
+              DialogSpec(
+                  kicker = "Destructive · power",
+                  destructive = true,
+                  title = "Restart $host?",
+                  // No counts: this dialog cannot know how many sessions or VMs
+                  // are running, and the old "2 and 2" was the mock's.
+                  body =
+                      "Running Claude Code sessions and Lima VMs will be interrupted, and a " +
+                          "homelab node on this Mac is gone until the reboot completes.",
+                  action = "Restart",
+                  word = "restart".takeIf { confirmDestructive },
+              )
+          DialogKind.Halt ->
+              DialogSpec(
+                  kicker = "Destructive · agent",
+                  destructive = true,
+                  title = "Halt Claude Code?",
+                  body =
+                      "Kills the running CLI process. Uncommitted edits in " +
+                          "worktree/auth stay on disk.",
+                  action = "Halt",
+                  word = "halt".takeIf { confirmDestructive },
+              )
+          // Typed like Restart, for the same reason: a merge lands on a
+          // branch other people are working from and no button on this phone
+          // can take it back.
+          is DialogKind.MergePr ->
+              DialogSpec(
+                  kicker = "Destructive · pull request",
+                  destructive = true,
+                  title = "Merge ${kind.repo}#${kind.number}?",
+                  body =
+                      "${Format.clip(kind.title)}\n\n" +
+                          "Runs gh pr merge --merge on the Mac. Branch protection still applies; " +
+                          "if GitHub refuses, its reason lands in the event log.",
+                  action = "Merge",
+                  word = "merge".takeIf { confirmDestructive },
+              )
+          is DialogKind.SyncApp ->
+              DialogSpec(
+                  kicker = "Destructive · argocd",
+                  destructive = true,
+                  title = "Sync ${kind.name}?",
+                  body =
+                      "Reconciles ${kind.namespace}/${kind.name} to what is in git. " +
+                          "Anything changed in the cluster by hand is replaced.",
+                  action = "Sync",
+                  word = "sync".takeIf { confirmDestructive },
+              )
+          // Not destructive -- Off undoes it exactly -- but it does change the
+          // Mac's configuration for every Claude Code session, which is why it
+          // asks at all. No typed word: nothing here is lost if it is wrong.
+          is DialogKind.EnableClaudePrompts ->
+              DialogSpec(
+                  kicker = "Claude Code · settings on the Mac",
+                  destructive = false,
+                  title = "Route Claude prompts to this phone?",
+                  body = Derive.claudeHookDialogBody(host, kind.waitSeconds),
+                  action = "Turn on",
+                  word = null,
+              )
+          // Not destructive, but it is trust: say exactly which address is
+          // asking, so a QR from anywhere but your own Mac's screen stands out.
+          is DialogKind.PairFromQr ->
+              DialogSpec(
+                  kicker = "Pairing · from a QR code",
+                  destructive = false,
+                  title = "Pair with ${kind.link.name.ifBlank { "this Mac" }}?",
+                  body =
+                      "This phone will be able to control the Mac at " +
+                          "${kind.link.url.substringAfter("://")}. Only pair if you just " +
+                          "scanned the QR code on your own Mac's screen.",
+                  action = "Pair",
+                  word = null,
+              )
+        }
+  }
+}

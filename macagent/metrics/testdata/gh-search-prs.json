@@ -1,0 +1,202 @@
+[
+  {
+    "number": 2226,
+    "repository": {
+      "name": "vitruvian-core",
+      "nameWithOwner": "VitruvianSoftware/vitruvian-core"
+    },
+    "title": "feat(remote-android): polish pass from an on-device audit",
+    "updatedAt": "2026-09-07T19:54:00Z",
+    "url": "https://github.com/VitruvianSoftware/vitruvian-core/pull/2226"
+  },
+  {
+    "number": 31,
+    "repository": {
+      "name": "widgets",
+      "nameWithOwner": "example-org/widgets"
+    },
+    "title": "feat(api): add pagination to the list endpoint",
+    "updatedAt": "2026-08-06T07:43:48Z",
+    "url": "https://github.com/example-org/widgets/pull/31"
+  },
+  {
+    "number": 21,
+    "repository": {
+      "name": "gadgets",
+      "nameWithOwner": "example-org/gadgets"
+    },
+    "title": "fix(ui): keep the sidebar width on reload",
+    "updatedAt": "2026-08-06T07:36:51Z",
+    "url": "https://github.com/example-org/gadgets/pull/21"
+  },
+  {
+    "number": 30,
+    "repository": {
+      "name": "docs-site",
+      "nameWithOwner": "example-org/docs-site"
+    },
+    "title": "chore(deps): bump the lint toolchain",
+    "updatedAt": "2026-08-06T07:44:33Z",
+    "url": "https://github.com/example-org/docs-site/pull/30"
+  },
+  {
+    "number": 590,
+    "repository": {
+      "name": "infra-modules",
+      "nameWithOwner": "example-org/infra-modules"
+    },
+    "title": "docs: explain the release steps",
+    "updatedAt": "2026-09-07T11:49:59Z",
+    "url": "https://github.com/example-org/infra-modules/pull/590"
+  },
+  {
+    "number": 591,
+    "repository": {
+      "name": "widgets",
+      "nameWithOwner": "example-org/widgets"
+    },
+    "title": "refactor(core): split the parser module",
+    "updatedAt": "2026-09-07T11:49:59Z",
+    "url": "https://github.com/example-org/widgets/pull/591"
+  },
+  {
+    "number": 588,
+    "repository": {
+      "name": "gadgets",
+      "nameWithOwner": "example-org/gadgets"
+    },
+    "title": "test: cover the empty-response path",
+    "updatedAt": "2026-09-07T11:50:38Z",
+    "url": "https://github.com/example-org/gadgets/pull/588"
+  },
+  {
+    "number": 587,
+    "repository": {
+      "name": "docs-site",
+      "nameWithOwner": "example-org/docs-site"
+    },
+    "title": "ci: cache the build between jobs",
+    "updatedAt": "2026-09-07T11:50:34Z",
+    "url": "https://github.com/example-org/docs-site/pull/587"
+  },
+  {
+    "number": 557,
+    "repository": {
+      "name": "infra-modules",
+      "nameWithOwner": "example-org/infra-modules"
+    },
+    "title": "fix(auth): refresh tokens before they expire",
+    "updatedAt": "2026-08-05T18:01:05Z",
+    "url": "https://github.com/example-org/infra-modules/pull/557"
+  },
+  {
+    "number": 483,
+    "repository": {
+      "name": "widgets",
+      "nameWithOwner": "example-org/widgets"
+    },
+    "title": "feat(api): add pagination to the list endpoint",
+    "updatedAt": "2026-09-07T18:00:48Z",
+    "url": "https://github.com/example-org/widgets/pull/483"
+  },
+  {
+    "number": 474,
+    "repository": {
+      "name": "gadgets",
+      "nameWithOwner": "example-org/gadgets"
+    },
+    "title": "fix(ui): keep the sidebar width on reload",
+    "updatedAt": "2026-08-25T07:49:39Z",
+    "url": "https://github.com/example-org/gadgets/pull/474"
+  },
+  {
+    "number": 39,
+    "repository": {
+      "name": "aspect-workflows-template",
+      "nameWithOwner": "VitruvianSoftware/aspect-workflows-template"
+    },
+    "title": "chore(platform-v2.0): release 3.0.0",
+    "updatedAt": "2026-08-20T03:19:15Z",
+    "url": "https://github.com/VitruvianSoftware/aspect-workflows-template/pull/39"
+  },
+  {
+    "number": 29,
+    "repository": {
+      "name": "nexus-agent",
+      "nameWithOwner": "VitruvianSoftware/nexus-agent"
+    },
+    "title": "chore(main): release nexus-agent 1.11.0",
+    "updatedAt": "2026-06-26T17:15:07Z",
+    "url": "https://github.com/VitruvianSoftware/nexus-agent/pull/29"
+  },
+  {
+    "number": 22,
+    "repository": {
+      "name": "homelab",
+      "nameWithOwner": "VitruvianSoftware/homelab"
+    },
+    "title": "chore(main): release 1.1.0",
+    "updatedAt": "2026-06-26T17:11:38Z",
+    "url": "https://github.com/VitruvianSoftware/homelab/pull/22"
+  },
+  {
+    "number": 258,
+    "repository": {
+      "name": "devx",
+      "nameWithOwner": "VitruvianSoftware/devx"
+    },
+    "title": "chore(main): release 0.66.0",
+    "updatedAt": "2026-06-26T19:55:18Z",
+    "url": "https://github.com/VitruvianSoftware/devx/pull/258"
+  },
+  {
+    "number": 47,
+    "repository": {
+      "name": "docs-site",
+      "nameWithOwner": "example-org/docs-site"
+    },
+    "title": "chore(deps): bump the lint toolchain",
+    "updatedAt": "2026-05-08T08:06:43Z",
+    "url": "https://github.com/example-org/docs-site/pull/47"
+  },
+  {
+    "number": 53,
+    "repository": {
+      "name": "infra-modules",
+      "nameWithOwner": "example-org/infra-modules"
+    },
+    "title": "docs: explain the release steps",
+    "updatedAt": "2025-11-21T08:16:06Z",
+    "url": "https://github.com/example-org/infra-modules/pull/53"
+  },
+  {
+    "number": 201,
+    "repository": {
+      "name": "widgets",
+      "nameWithOwner": "example-org/widgets"
+    },
+    "title": "refactor(core): split the parser module",
+    "updatedAt": "2025-09-17T05:35:45Z",
+    "url": "https://github.com/example-org/widgets/pull/201"
+  },
+  {
+    "number": 4,
+    "repository": {
+      "name": "gadgets",
+      "nameWithOwner": "example-org/gadgets"
+    },
+    "title": "test: cover the empty-response path",
+    "updatedAt": "2025-08-30T04:58:56Z",
+    "url": "https://github.com/example-org/gadgets/pull/4"
+  },
+  {
+    "number": 3,
+    "repository": {
+      "name": "docs-site",
+      "nameWithOwner": "example-org/docs-site"
+    },
+    "title": "ci: cache the build between jobs",
+    "updatedAt": "2025-08-29T07:17:35Z",
+    "url": "https://github.com/example-org/docs-site/pull/3"
+  }
+]

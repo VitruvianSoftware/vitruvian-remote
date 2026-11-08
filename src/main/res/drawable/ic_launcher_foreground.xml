@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright (c) 2026 VitruvianSoftware
+  SPDX-License-Identifier: MIT
+
+  The Golden-Datum V (Official Vitruvian Brand Mark):
+  Leonardo da Vinci Vitruvian geometric drafting on the 108 x 108 adaptive-icon canvas.
+  Features outer corner registration brackets, a precision square with inscribed circle,
+  a horizontal golden-ratio shoulder datum (1:phi), the bold geometric V spanning from
+  the upper circle-square intersections to the bottom pole, and a terracotta-sanguine
+  navel pivot dot at (54, 54). Core elements sit inside the 72 dp safe zone.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Ambient glow underlay for core Vitruvian geometry -->
+    <path
+        android:pathData="M35,35 H73 V73 H35 Z M29,54 a25,25 0 1,0 50,0 a25,25 0 1,0 -50,0"
+        android:strokeColor="#5980A6"
+        android:strokeAlpha="0.35"
+        android:strokeWidth="3.5" />
+
+    <!-- Blueprint drafting extension gridlines -->
+    <path
+        android:pathData="M20,35 H88 M20,73 H88 M35,20 V88 M73,20 V88"
+        android:strokeColor="#5980A6"
+        android:strokeAlpha="0.38"
+        android:strokeWidth="0.8" />
+
+    <!-- Outer corner registration brackets -->
+    <path
+        android:pathData="M26,36 V26 H36 M72,26 H82 V36 M82,72 V82 H72 M36,82 H26 V72"
+        android:strokeColor="#93B0CA"
+        android:strokeAlpha="0.60"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="square"
+        android:strokeLineJoin="miter" />
+
+    <!-- Primary Vitruvian square -->
+    <path
+        android:pathData="M35,35 H73 V73 H35 Z"
+        android:strokeColor="#93B0CA"
+        android:strokeAlpha="0.60"
+        android:strokeWidth="2.2" />
+
+    <!-- Golden-ratio horizontal shoulder datum (1 : phi) -->
+    <path
+        android:pathData="M35,47 H73"
+        android:strokeColor="#93B0CA"
+        android:strokeAlpha="0.60"
+        android:strokeWidth="2.0" />
+
+    <!-- Primary inscribed circle -->
+    <path
+        android:pathData="M29,54 a25,25 0 1,0 50,0 a25,25 0 1,0 -50,0"
+        android:strokeColor="#93B0CA"
+        android:strokeWidth="2.8" />
+
+    <!-- Bold geometric Golden-Datum V -->
+    <path
+        android:pathData="M38,38 L54,75 L70,38"
+        android:strokeColor="#93B0CA"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="square"
+        android:strokeLineJoin="miter" />
+
+    <!-- Terracotta-sanguine center navel pivot dot -->
+    <path
+        android:pathData="M50.8,54 a3.2,3.2 0 1,0 6.4,0 a3.2,3.2 0 1,0 -6.4,0"
+        android:fillColor="#D47657" />
+
+</vector>
