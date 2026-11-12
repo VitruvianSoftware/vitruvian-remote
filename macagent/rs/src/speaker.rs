@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! HomeSpeaker (`apps/desktop/home-speaker`) state, settings, volume, and speech endpoints.
+//! Vitruvian Speaker (`apps/desktop/vitruvian-speaker`) state, settings, volume, and speech endpoints.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,17 +35,18 @@ use crate::http_util::{log_act, HttpRequest, HttpResponse};
 use crate::phone::{first_text_content, PhoneBridge};
 use crate::sampler::run_tool_within;
 
-pub const HOME_SPEAKER_BINARY: &str = "/Applications/HomeSpeaker.app/Contents/MacOS/HomeSpeaker";
+pub const SPEAKER_BINARY: &str =
+    "/Applications/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker";
 pub const DEFAULT_LOCAL_VOICE: &str = "com.apple.ttsbundle.siri_Aaron_en-US_premium";
 pub const RECENT_BROADCASTS: usize = 5;
 pub const MAX_PHONE_SAY_BODY: usize = 8 << 20;
 pub const PHONE_SAY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SAY_LIMIT: Duration = Duration::from_secs(90);
 pub const VOLUME_LIMIT: Duration = Duration::from_secs(45);
-/// The oldest Home Speaker that answers `--state` and `--apply`. Older programs would take them
+/// The oldest Vitruvian Speaker that answers `--state` and `--apply`. Older programs would take them
 /// for unknown arguments and start their menu-bar app.
-pub const MIN_HOME_SPEAKER_VERSION: &str = "1.41.0";
-/// The oldest Home Speaker whose `--apply` `switchTo` operation accepts `copy: true`.
+pub const MIN_SPEAKER_VERSION: &str = "1.41.0";
+/// The oldest Vitruvian Speaker whose `--apply` `switchTo` operation accepts `copy: true`.
 pub const MIN_DOOR_COPY_VERSION: &str = "1.41.0";
 
 pub fn supports_door_copy(version: &str) -> bool {
@@ -59,8 +60,9 @@ pub const APPLY_LIMIT: Duration = Duration::from_secs(120);
 /// The `contract_version` of the `--state` document this helper reads.
 const STATE_CONTRACT_VERSION: i64 = 1;
 
-/// Returned with HTTP 409 when a sign-in, grant-chat, or disconnect-chat job is already running (`HomeSpeakerTool.swift:2116`).
-pub const SIGN_IN_ALREADY_RUNNING: &str = "A HomeSpeaker sign-in is already running on the Mac";
+/// Returned with HTTP 409 when a sign-in, grant-chat, or disconnect-chat job is already running (`VitruvianSpeakerTool.swift:2116`).
+pub const SIGN_IN_ALREADY_RUNNING: &str =
+    "A Vitruvian Speaker sign-in is already running on the Mac";
 pub const AGENT_MARKERS: &[&str] = &["CLAUDECODE", "ANTIGRAVITY_AGENT", "OPENCODE", "AI_AGENT"];
 
 pub type RunnerFn =
@@ -71,7 +73,7 @@ pub type CaptureFn =
 pub type ReadClipboardFn = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 
 #[derive(Clone)]
-pub struct HomeSpeaker {
+pub struct VitruvianSpeaker {
     /// The app's program. The extension's is named by the choice file.
     pub binary: PathBuf,
     /// The choice file (`speaker_door.json`): read only, to learn which program is chosen.
@@ -87,13 +89,13 @@ pub struct HomeSpeaker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerVoice {
+pub struct VitruvianSpeakerVoice {
     pub id: String,
     pub name: String,
     pub lang: String,
 }
 
-impl HomeSpeakerVoice {
+impl VitruvianSpeakerVoice {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("id".to_string(), JsonValue::String(self.id.clone()));
@@ -104,13 +106,13 @@ impl HomeSpeakerVoice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerHome {
+pub struct VitruvianSpeakerHome {
     pub id: String,
     pub name: String,
     pub selected: bool,
 }
 
-impl HomeSpeakerHome {
+impl VitruvianSpeakerHome {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("id".to_string(), JsonValue::String(self.id.clone()));
@@ -121,7 +123,7 @@ impl HomeSpeakerHome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerAgentHook {
+pub struct VitruvianSpeakerAgentHook {
     pub agent: String,
     pub agent_slug: String,
     pub hook_state: String,
@@ -131,7 +133,7 @@ pub struct HomeSpeakerAgentHook {
     pub configured_by_instruction: bool,
 }
 
-impl HomeSpeakerAgentHook {
+impl VitruvianSpeakerAgentHook {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("agent".to_string(), JsonValue::String(self.agent.clone()));
@@ -170,12 +172,12 @@ impl HomeSpeakerAgentHook {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerCustomVoice {
+pub struct VitruvianSpeakerCustomVoice {
     pub id: String,
     pub name: String,
 }
 
-impl HomeSpeakerCustomVoice {
+impl VitruvianSpeakerCustomVoice {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("id".to_string(), JsonValue::String(self.id.clone()));
@@ -185,17 +187,17 @@ impl HomeSpeakerCustomVoice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerBeeperNetwork {
+pub struct VitruvianSpeakerBeeperNetwork {
     pub key: String,
     pub name: String,
     pub state: String,
-    /// Courier only: read through Courier although HomeSpeaker's own Slack
+    /// Courier only: read through Courier although Vitruvian Speaker's own Slack
     /// or Google Chat reader covers it (`chat_monitor.courier_read_anyway`).
     /// Sent only when true, so Beeper's rows keep their shape.
     pub read_anyway: bool,
 }
 
-impl HomeSpeakerBeeperNetwork {
+impl VitruvianSpeakerBeeperNetwork {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("key".to_string(), JsonValue::String(self.key.clone()));
@@ -209,28 +211,28 @@ impl HomeSpeakerBeeperNetwork {
 }
 
 /// `courier_read_anyway`: read one of Courier's networks although
-/// HomeSpeaker's own reader covers it (`on`), or leave it to that reader.
+/// Vitruvian Speaker's own reader covers it (`on`), or leave it to that reader.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerReadAnywayUpdate {
+pub struct VitruvianSpeakerReadAnywayUpdate {
     pub key: String,
     pub on: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerBeeperNetworkUpdate {
+pub struct VitruvianSpeakerBeeperNetworkUpdate {
     pub key: String,
     pub reading: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerQuiet {
+pub struct VitruvianSpeakerQuiet {
     pub enabled: bool,
     pub start: String,
     pub end: String,
     pub active: bool,
 }
 
-impl HomeSpeakerQuiet {
+impl VitruvianSpeakerQuiet {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("enabled".to_string(), JsonValue::Bool(self.enabled));
@@ -242,7 +244,7 @@ impl HomeSpeakerQuiet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerTarget {
+pub struct VitruvianSpeakerTarget {
     pub key: String,
     pub name: String,
     pub room: String,
@@ -251,7 +253,7 @@ pub struct HomeSpeakerTarget {
     pub display_line: String,
 }
 
-impl HomeSpeakerTarget {
+impl VitruvianSpeakerTarget {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("key".to_string(), JsonValue::String(self.key.clone()));
@@ -271,7 +273,7 @@ impl HomeSpeakerTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerLast {
+pub struct VitruvianSpeakerLast {
     pub id: String,
     pub text: String,
     pub target: String,
@@ -279,7 +281,7 @@ pub struct HomeSpeakerLast {
     pub at: Timestamp,
 }
 
-impl HomeSpeakerLast {
+impl VitruvianSpeakerLast {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         if !self.id.is_empty() {
@@ -294,7 +296,7 @@ impl HomeSpeakerLast {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HomeSpeakerVolume {
+pub struct VitruvianSpeakerVolume {
     pub available: bool,
     pub reason: String,
     pub speaker: String,
@@ -303,7 +305,7 @@ pub struct HomeSpeakerVolume {
     pub online: bool,
 }
 
-impl HomeSpeakerVolume {
+impl VitruvianSpeakerVolume {
     pub fn from_json(v: &JsonValue) -> Option<Self> {
         let obj = v.as_object()?;
         Some(Self {
@@ -347,7 +349,7 @@ impl HomeSpeakerVolume {
 }
 
 #[derive(Clone, Debug)]
-pub struct HomeSpeakerState {
+pub struct VitruvianSpeakerState {
     pub available: bool,
     pub reason: String,
     pub installed: bool,
@@ -379,16 +381,16 @@ pub struct HomeSpeakerState {
     pub style_model: String,
     pub custom_style_prompt: String,
     pub home_cast_voice: bool,
-    pub custom_voices: Vec<HomeSpeakerCustomVoice>,
+    pub custom_voices: Vec<VitruvianSpeakerCustomVoice>,
     pub structure_name: String,
-    pub quiet_hours: HomeSpeakerQuiet,
-    pub targets: Vec<HomeSpeakerTarget>,
-    pub last: Option<HomeSpeakerLast>,
+    pub quiet_hours: VitruvianSpeakerQuiet,
+    pub targets: Vec<VitruvianSpeakerTarget>,
+    pub last: Option<VitruvianSpeakerLast>,
     pub quiet_hours_active: bool,
     pub snooze_until: Option<String>,
-    pub available_voices: Vec<HomeSpeakerVoice>,
+    pub available_voices: Vec<VitruvianSpeakerVoice>,
     pub structure_id: String,
-    pub homes: Vec<HomeSpeakerHome>,
+    pub homes: Vec<VitruvianSpeakerHome>,
     pub account_email: String,
     pub has_oauth_client: bool,
     pub has_antigravity_tokens: bool,
@@ -406,11 +408,11 @@ pub struct HomeSpeakerState {
     pub gws_account: String,
     pub google_chat_source: String,
     pub poll_interval: i64,
-    pub agents: Vec<HomeSpeakerAgentHook>,
+    pub agents: Vec<VitruvianSpeakerAgentHook>,
     pub legacy_launch_agent: bool,
     pub custom_oauth_client_id: String,
     pub has_custom_oauth_secret: bool,
-    pub home_speaker_version: String,
+    pub speaker_version: String,
     pub announce_claude_code: Option<bool>,
     pub announce_antigravity: Option<bool>,
     pub announce_opencode: Option<bool>,
@@ -421,27 +423,27 @@ pub struct HomeSpeakerState {
     pub google_chat_enabled: Option<bool>,
     pub beeper_enabled: Option<bool>,
     pub beeper_announce: String,
-    pub beeper_networks: Vec<HomeSpeakerBeeperNetwork>,
+    pub beeper_networks: Vec<VitruvianSpeakerBeeperNetwork>,
     /// The running monitor has listed Beeper's networks; until it has,
     /// only the saved mutes are known.
     pub beeper_networks_listed: bool,
     pub courier_enabled: Option<bool>,
     pub courier_announce: String,
-    pub courier_networks: Vec<HomeSpeakerBeeperNetwork>,
+    pub courier_networks: Vec<VitruvianSpeakerBeeperNetwork>,
     pub courier_networks_listed: bool,
     pub mute_own_messages: Option<bool>,
-    pub recent: Vec<HomeSpeakerLast>,
-    /// Home Speaker's own warnings about its setup.
+    pub recent: Vec<VitruvianSpeakerLast>,
+    /// Vitruvian Speaker's own warnings about its setup.
     pub warnings: Vec<String>,
-    /// Home Speaker's `settings[]` catalog passed through verbatim from `--state --json`.
+    /// Vitruvian Speaker's `settings[]` catalog passed through verbatim from `--state --json`.
     pub settings: Vec<JsonValue>,
-    /// Home Speaker's summary of active outputs (`outputs_label`), when available.
+    /// Vitruvian Speaker's summary of active outputs (`outputs_label`), when available.
     pub outputs_label: Option<String>,
-    /// Home Speaker's explanation of active outputs (`outputs_footer`), when available.
+    /// Vitruvian Speaker's explanation of active outputs (`outputs_footer`), when available.
     pub outputs_footer: Option<String>,
 }
 
-impl Default for HomeSpeakerState {
+impl Default for VitruvianSpeakerState {
     fn default() -> Self {
         Self {
             available: false,
@@ -477,7 +479,7 @@ impl Default for HomeSpeakerState {
             home_cast_voice: false,
             custom_voices: Vec::new(),
             structure_name: String::new(),
-            quiet_hours: HomeSpeakerQuiet {
+            quiet_hours: VitruvianSpeakerQuiet {
                 enabled: false,
                 start: String::new(),
                 end: String::new(),
@@ -511,7 +513,7 @@ impl Default for HomeSpeakerState {
             legacy_launch_agent: false,
             custom_oauth_client_id: String::new(),
             has_custom_oauth_secret: false,
-            home_speaker_version: String::new(),
+            speaker_version: String::new(),
             announce_claude_code: None,
             announce_antigravity: None,
             announce_opencode: None,
@@ -536,7 +538,7 @@ impl Default for HomeSpeakerState {
     }
 }
 
-impl HomeSpeakerState {
+impl VitruvianSpeakerState {
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonObject::new();
         m.insert("available".to_string(), JsonValue::Bool(self.available));
@@ -788,10 +790,10 @@ impl HomeSpeakerState {
             "has_custom_oauth_secret".to_string(),
             JsonValue::Bool(self.has_custom_oauth_secret),
         );
-        if !self.home_speaker_version.is_empty() {
+        if !self.speaker_version.is_empty() {
             m.insert(
-                "home_speaker_version".to_string(),
-                JsonValue::String(self.home_speaker_version.clone()),
+                "speaker_version".to_string(),
+                JsonValue::String(self.speaker_version.clone()),
             );
         }
         m.insert(
@@ -909,7 +911,7 @@ impl HomeSpeakerState {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct HomeSpeakerUpdate {
+pub struct VitruvianSpeakerUpdate {
     pub enabled: Option<bool>,
     pub default_target: Option<String>,
     pub speech_length: Option<String>,
@@ -967,16 +969,16 @@ pub struct HomeSpeakerUpdate {
     pub google_chat_enabled: Option<bool>,
     pub beeper_enabled: Option<bool>,
     pub beeper_announce: Option<String>,
-    pub beeper_network: Option<HomeSpeakerBeeperNetworkUpdate>,
+    pub beeper_network: Option<VitruvianSpeakerBeeperNetworkUpdate>,
     pub courier_enabled: Option<bool>,
     pub courier_announce: Option<String>,
-    pub courier_network: Option<HomeSpeakerBeeperNetworkUpdate>,
-    pub courier_read_anyway: Option<HomeSpeakerReadAnywayUpdate>,
+    pub courier_network: Option<VitruvianSpeakerBeeperNetworkUpdate>,
+    pub courier_read_anyway: Option<VitruvianSpeakerReadAnywayUpdate>,
     pub mute_own_messages: Option<bool>,
     pub settings: Vec<(String, JsonValue)>,
 }
 
-impl HomeSpeakerUpdate {
+impl VitruvianSpeakerUpdate {
     pub fn empty(&self) -> bool {
         self.enabled.is_none()
             && self.default_target.is_none()
@@ -1047,7 +1049,7 @@ impl HomeSpeakerUpdate {
     pub fn from_json(v: &JsonValue) -> Result<Self, String> {
         let obj = v
             .as_object()
-            .ok_or_else(|| "cannot unmarshal non-object into HomeSpeakerUpdate".to_string())?;
+            .ok_or_else(|| "cannot unmarshal non-object into VitruvianSpeakerUpdate".to_string())?;
         let mut u = Self::default();
 
         fn opt_bool(obj: &JsonObject, key: &str) -> Result<Option<bool>, String> {
@@ -1167,13 +1169,13 @@ impl HomeSpeakerUpdate {
             }
         }
         u.beeper_network = opt_network(obj, "beeper_network", "reading")?
-            .map(|(key, reading)| HomeSpeakerBeeperNetworkUpdate { key, reading });
+            .map(|(key, reading)| VitruvianSpeakerBeeperNetworkUpdate { key, reading });
         u.courier_enabled = opt_bool(obj, "courier_enabled")?;
         u.courier_announce = opt_str(obj, "courier_announce")?;
         u.courier_network = opt_network(obj, "courier_network", "reading")?
-            .map(|(key, reading)| HomeSpeakerBeeperNetworkUpdate { key, reading });
+            .map(|(key, reading)| VitruvianSpeakerBeeperNetworkUpdate { key, reading });
         u.courier_read_anyway = opt_network(obj, "courier_read_anyway", "on")?
-            .map(|(key, on)| HomeSpeakerReadAnywayUpdate { key, on });
+            .map(|(key, on)| VitruvianSpeakerReadAnywayUpdate { key, on });
         u.mute_own_messages = opt_bool(obj, "mute_own_messages")?;
         if let Some(sv) = obj.get("settings") {
             if !sv.is_null() {
@@ -1192,7 +1194,7 @@ impl HomeSpeakerUpdate {
     }
 }
 
-/// `--apply` operations the helper sends to Home Speaker.
+/// `--apply` operations the helper sends to Vitruvian Speaker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOp {
     Set,
@@ -1232,7 +1234,7 @@ impl ApplyOp {
     }
 }
 
-/// Command-line invocations the helper runs on Home Speaker's binary.
+/// Command-line invocations the helper runs on Vitruvian Speaker's binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliAction {
     Say { text: String, no_history: bool },
@@ -1286,7 +1288,7 @@ impl CliAction {
     }
 }
 
-/// Actions the helper performs itself without calling Home Speaker's `--apply` or CLI.
+/// Actions the helper performs itself without calling Vitruvian Speaker's `--apply` or CLI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperAction {
     PreviewVoice,
@@ -1491,7 +1493,7 @@ impl Drop for SignInBusyGuard {
     }
 }
 
-impl HomeSpeaker {
+impl VitruvianSpeaker {
     pub fn new() -> Self {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
@@ -1500,7 +1502,7 @@ impl HomeSpeaker {
         let launch_busy = sign_in_busy.clone();
         Self {
             door_path: home.join(".gemini").join("speaker_door.json"),
-            binary: PathBuf::from(HOME_SPEAKER_BINARY),
+            binary: PathBuf::from(SPEAKER_BINARY),
             run: Arc::new(|limit, name, args| {
                 let (out, err_s, err_opt) = run_tool_within(limit, name, args, None);
                 match err_opt {
@@ -1544,9 +1546,9 @@ impl HomeSpeaker {
         runner(limit, name, args)
     }
 
-    /// HomeSpeaker as a `/v1/tools` entry: present when the active door's program exists, or when
-    /// only the Vitruvian extension is installed (no `/Applications/HomeSpeaker.app`). Checking the
-    /// app bundle alone hid HomeSpeaker on extension-only Macs.
+    /// Vitruvian Speaker as a `/v1/tools` entry: present when the active door's program exists, or when
+    /// only the Vitruvian extension is installed (no `/Applications/Vitruvian Speaker.app`). Checking the
+    /// app bundle alone hid Vitruvian Speaker on extension-only Macs.
     pub fn tool(&self) -> Tool {
         let p = self.active_program();
         if file_exists(&p.binary) {
@@ -1592,8 +1594,8 @@ impl HomeSpeaker {
     }
 
     /// The program the helper talks to: the app or the extension, as the choice file says.
-    pub fn active_program(&self) -> HomeSpeakerProgram {
-        let app = HomeSpeakerProgram {
+    pub fn active_program(&self) -> VitruvianSpeakerProgram {
+        let app = VitruvianSpeakerProgram {
             door: "app".to_string(),
             binary: self.binary.clone(),
         };
@@ -1611,7 +1613,7 @@ impl HomeSpeaker {
             _ => false,
         };
         if use_extension {
-            HomeSpeakerProgram {
+            VitruvianSpeakerProgram {
                 door: "extension".to_string(),
                 binary: PathBuf::from(ext),
             }
@@ -1620,12 +1622,12 @@ impl HomeSpeaker {
         }
     }
 
-    /// Runs one Home Speaker command and keeps its output even when it exits non-zero:
+    /// Runs one Vitruvian Speaker command and keeps its output even when it exits non-zero:
     /// `--apply` explains a refusal in JSON on stdout and exits 1.
     fn call_program(
         &self,
         limit: Duration,
-        program: &HomeSpeakerProgram,
+        program: &VitruvianSpeakerProgram,
         args: &[String],
     ) -> Result<(String, String, i32), String> {
         let name = program.binary.to_string_lossy();
@@ -1646,11 +1648,11 @@ impl HomeSpeaker {
     }
 
     /// Asks `program` for its version, once per request (`verified` remembers who has answered).
-    /// Below `MIN_HOME_SPEAKER_VERSION` nothing else may be run on it: an old program would
+    /// Below `MIN_SPEAKER_VERSION` nothing else may be run on it: an old program would
     /// read `--state` as an unknown argument and start its menu-bar app.
     fn read_verified_version(
         &self,
-        program: &HomeSpeakerProgram,
+        program: &VitruvianSpeakerProgram,
         verified: &mut Vec<PathBuf>,
     ) -> Result<String, VersionProblem> {
         let args = vec!["--version".to_string()];
@@ -1667,21 +1669,21 @@ impl HomeSpeaker {
                 "it did not print a version".to_string(),
             ));
         };
-        if version_at_least(&have, MIN_HOME_SPEAKER_VERSION) {
+        if version_at_least(&have, MIN_SPEAKER_VERSION) {
             if !verified.contains(&program.binary) {
                 verified.push(program.binary.clone());
             }
             return Ok(have);
         }
         Err(VersionProblem::TooOld(format!(
-            "Update Home Speaker on {} (have {have}, need {MIN_HOME_SPEAKER_VERSION})",
+            "Update Vitruvian Speaker on {} (have {have}, need {MIN_SPEAKER_VERSION})",
             crate::sampler::get_hostname()
         )))
     }
 
     fn check_version(
         &self,
-        program: &HomeSpeakerProgram,
+        program: &VitruvianSpeakerProgram,
         verified: &mut Vec<PathBuf>,
     ) -> Result<(), VersionProblem> {
         if verified.contains(&program.binary) {
@@ -1693,51 +1695,53 @@ impl HomeSpeaker {
     /// `--state --json` from `program`, after the version gate.
     fn fetch_state_doc(
         &self,
-        program: &HomeSpeakerProgram,
+        program: &VitruvianSpeakerProgram,
         verified: &mut Vec<PathBuf>,
     ) -> Result<JsonValue, String> {
         match self.check_version(program, verified) {
             Ok(()) => {}
             Err(VersionProblem::TooOld(sentence)) => return Err(sentence),
             Err(VersionProblem::Unreadable(e)) => {
-                return Err(format!("Could not read the Home Speaker version: {e}"))
+                return Err(format!("Could not read the Vitruvian Speaker version: {e}"))
             }
         }
         let args = vec!["--state".to_string(), "--json".to_string()];
         let (stdout, _, code) = self
             .call_program(STATE_LIMIT, program, &args)
-            .map_err(|e| format!("Home Speaker did not answer --state: {e}"))?;
+            .map_err(|e| format!("Vitruvian Speaker did not answer --state: {e}"))?;
         if code != 0 {
-            return Err(format!("Home Speaker's --state exited with status {code}"));
+            return Err(format!(
+                "Vitruvian Speaker's --state exited with status {code}"
+            ));
         }
         let doc = JsonValue::parse(stdout.trim())
-            .map_err(|_| "Home Speaker's --state answer was not JSON".to_string())?;
+            .map_err(|_| "Vitruvian Speaker's --state answer was not JSON".to_string())?;
         let Some(obj) = doc.as_object() else {
-            return Err("Home Speaker's --state answer was not a JSON object".to_string());
+            return Err("Vitruvian Speaker's --state answer was not a JSON object".to_string());
         };
         match obj.get("contract_version").and_then(|v| v.as_i64()) {
             Some(STATE_CONTRACT_VERSION) => Ok(doc),
             other => Err(format!(
-                "Home Speaker answered --state in contract version {}, this helper reads {STATE_CONTRACT_VERSION}",
+                "Vitruvian Speaker answered --state in contract version {}, this helper reads {STATE_CONTRACT_VERSION}",
                 other.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string())
             )),
         }
     }
 
-    pub fn state(&self) -> HomeSpeakerState {
+    pub fn state(&self) -> VitruvianSpeakerState {
         self.state_checked(&mut Vec::new())
     }
 
-    fn state_checked(&self, verified: &mut Vec<PathBuf>) -> HomeSpeakerState {
+    fn state_checked(&self, verified: &mut Vec<PathBuf>) -> VitruvianSpeakerState {
         let program = self.active_program();
-        let mut st = HomeSpeakerState {
+        let mut st = VitruvianSpeakerState {
             active_door: program.door.clone(),
             extension_installed: self.extension_installed(),
             ..Default::default()
         };
         if !file_exists(&program.binary) {
             st.reason = format!(
-                "HomeSpeaker is not installed at {}",
+                "Vitruvian Speaker is not installed at {}",
                 program.binary.display()
             );
             return st;
@@ -1750,7 +1754,7 @@ impl HomeSpeaker {
                 return st;
             }
             Err(VersionProblem::Unreadable(e)) => {
-                st.reason = format!("Could not read the Home Speaker version: {e}");
+                st.reason = format!("Could not read the Vitruvian Speaker version: {e}");
                 return st;
             }
         }
@@ -1780,7 +1784,7 @@ impl HomeSpeaker {
     fn run_helper_action(
         &self,
         action: HelperAction,
-        program: &HomeSpeakerProgram,
+        program: &VitruvianSpeakerProgram,
         verified: &mut Vec<PathBuf>,
     ) -> Result<&'static str, ApplyError> {
         match action {
@@ -1799,17 +1803,17 @@ impl HomeSpeaker {
         }
     }
 
-    /// Applies one phone update: Home Speaker's own `--apply` for settings, secrets, snooze, chat
+    /// Applies one phone update: Vitruvian Speaker's own `--apply` for settings, secrets, snooze, chat
     /// networks, hooks and the door; its command-line flags for sign-in, discovery, speech and the
     /// chat monitor. Order: the plain batch, the flag commands, then `agentHook`, then `switchTo`
     /// last (a switch changes which program is chosen). The first failure stops everything.
-    pub fn apply(&self, u: HomeSpeakerUpdate) -> Result<String, ApplyError> {
+    pub fn apply(&self, u: VitruvianSpeakerUpdate) -> Result<String, ApplyError> {
         self.apply_checked(u, &mut Vec::new())
     }
 
     fn apply_checked(
         &self,
-        u: HomeSpeakerUpdate,
+        u: VitruvianSpeakerUpdate,
         verified: &mut Vec<PathBuf>,
     ) -> Result<String, ApplyError> {
         let needs_oauth_doc = u.oauth_client_id.is_none() && u.oauth_client_secret.is_some();
@@ -1818,7 +1822,7 @@ impl HomeSpeaker {
             let active = self.active_program();
             if !file_exists(&active.binary) {
                 return Err(ApplyError::Conflict(format!(
-                    "HomeSpeaker is not installed at {}",
+                    "Vitruvian Speaker is not installed at {}",
                     active.binary.display()
                 )));
             }
@@ -1843,7 +1847,7 @@ impl HomeSpeaker {
             for (k, _) in &u.settings {
                 if !known.iter().any(|valid| *valid == k.as_str()) {
                     return Err(ApplyError::BadRequest(format!(
-                        "unknown Home Speaker setting: {k}"
+                        "unknown Vitruvian Speaker setting: {k}"
                     )));
                 }
             }
@@ -1859,7 +1863,7 @@ impl HomeSpeaker {
         let copy_version = if u.copy == Some(true) && u.active_door.is_some() {
             let from_doc = pre_doc
                 .as_ref()
-                .map(|doc| doc.get_str("home_speaker_version").to_string())
+                .map(|doc| doc.get_str("speaker_version").to_string())
                 .filter(|v| !v.is_empty());
             match from_doc {
                 Some(v) => Some(v),
@@ -1867,7 +1871,7 @@ impl HomeSpeaker {
                     let active = self.active_program();
                     if !file_exists(&active.binary) {
                         return Err(ApplyError::Conflict(format!(
-                            "HomeSpeaker is not installed at {}",
+                            "Vitruvian Speaker is not installed at {}",
                             active.binary.display()
                         )));
                     }
@@ -1876,7 +1880,7 @@ impl HomeSpeaker {
                             .map_err(|p| match p {
                                 VersionProblem::TooOld(sentence) => ApplyError::Conflict(sentence),
                                 VersionProblem::Unreadable(e) => ApplyError::Internal(format!(
-                                    "Could not read the Home Speaker version: {e}"
+                                    "Could not read the Vitruvian Speaker version: {e}"
                                 )),
                             })?;
                     Some(have)
@@ -1924,7 +1928,7 @@ impl HomeSpeaker {
         if u.sign_in {
             if !file_exists(&program.binary) {
                 return Err(ApplyError::BadRequest(format!(
-                    "HomeSpeaker is not installed at {}",
+                    "Vitruvian Speaker is not installed at {}",
                     program.binary.display()
                 )));
             }
@@ -1943,7 +1947,7 @@ impl HomeSpeaker {
         if u.grant_chat {
             if !file_exists(&program.binary) {
                 return Err(ApplyError::BadRequest(format!(
-                    "HomeSpeaker is not installed at {}",
+                    "Vitruvian Speaker is not installed at {}",
                     program.binary.display()
                 )));
             }
@@ -2020,7 +2024,7 @@ impl HomeSpeaker {
         loop {
             if !file_exists(&program.binary) {
                 return Err(ApplyError::Conflict(format!(
-                    "HomeSpeaker is not installed at {}",
+                    "Vitruvian Speaker is not installed at {}",
                     program.binary.display()
                 )));
             }
@@ -2031,7 +2035,7 @@ impl HomeSpeaker {
                 }
                 Err(VersionProblem::Unreadable(e)) => {
                     return Err(ApplyError::Internal(format!(
-                        "Could not read the Home Speaker version: {e}"
+                        "Could not read the Vitruvian Speaker version: {e}"
                     )))
                 }
             }
@@ -2049,15 +2053,17 @@ impl HomeSpeaker {
             let (stdout, _, exit) =
                 self.call_program(APPLY_LIMIT, &program, &args)
                     .map_err(|e| {
-                        ApplyError::Internal(format!("Home Speaker did not answer --apply: {e}"))
+                        ApplyError::Internal(format!(
+                            "Vitruvian Speaker did not answer --apply: {e}"
+                        ))
                     })?;
             // A refusal exits 1 with a JSON error: a valid answer. A non-zero exit without
             // JSON, or "ok" with a failing exit, is an error.
             let answer = JsonValue::parse(stdout.trim()).map_err(|_| {
                 ApplyError::Internal(if exit != 0 {
-                    format!("Home Speaker's --apply exited with status {exit}")
+                    format!("Vitruvian Speaker's --apply exited with status {exit}")
                 } else {
-                    "Home Speaker's --apply answer was not JSON".to_string()
+                    "Vitruvian Speaker's --apply answer was not JSON".to_string()
                 })
             })?;
             if answer.get_opt_bool("ok") == Some(true) {
@@ -2065,7 +2071,7 @@ impl HomeSpeaker {
                     Ok(())
                 } else {
                     Err(ApplyError::Internal(format!(
-                        "Home Speaker's --apply exited with status {exit}"
+                        "Vitruvian Speaker's --apply exited with status {exit}"
                     )))
                 };
             }
@@ -2074,7 +2080,7 @@ impl HomeSpeaker {
             let message = err
                 .map(|e| e.get_str("message"))
                 .filter(|m| !m.is_empty())
-                .unwrap_or("Home Speaker refused the change")
+                .unwrap_or("Vitruvian Speaker refused the change")
                 .to_string();
             if code == "not_chosen" && !retried {
                 let named = err
@@ -2095,23 +2101,26 @@ impl HomeSpeaker {
     }
 
     /// The program for `door`, read from the choice file now.
-    fn program_for_door(&self, door: &str) -> Option<HomeSpeakerProgram> {
+    fn program_for_door(&self, door: &str) -> Option<VitruvianSpeakerProgram> {
         let binary = match door {
             "app" => self.binary.clone(),
             "extension" => PathBuf::from(self.extension_program()?),
             _ => return None,
         };
-        file_exists(&binary).then(|| HomeSpeakerProgram {
+        file_exists(&binary).then(|| VitruvianSpeakerProgram {
             door: door.to_string(),
             binary,
         })
     }
 
-    pub fn run_volume(&self, args: &[String]) -> HomeSpeakerVolume {
+    pub fn run_volume(&self, args: &[String]) -> VitruvianSpeakerVolume {
         let p = self.active_program();
         if !file_exists(&p.binary) {
-            return HomeSpeakerVolume {
-                reason: format!("HomeSpeaker is not installed at {}", p.binary.display()),
+            return VitruvianSpeakerVolume {
+                reason: format!(
+                    "Vitruvian Speaker is not installed at {}",
+                    p.binary.display()
+                ),
                 ..Default::default()
             };
         }
@@ -2122,7 +2131,7 @@ impl HomeSpeaker {
         };
         for line in stdout.trim().lines() {
             if let Ok(val) = JsonValue::parse(line) {
-                if let Some(v) = HomeSpeakerVolume::from_json(&val) {
+                if let Some(v) = VitruvianSpeakerVolume::from_json(&val) {
                     return v;
                 }
             }
@@ -2131,7 +2140,7 @@ impl HomeSpeaker {
         if reason.is_empty() && !err_msg.is_empty() {
             for line in err_msg.lines() {
                 if let Ok(val) = JsonValue::parse(line) {
-                    if let Some(v) = HomeSpeakerVolume::from_json(&val) {
+                    if let Some(v) = VitruvianSpeakerVolume::from_json(&val) {
                         return v;
                     }
                 }
@@ -2139,9 +2148,10 @@ impl HomeSpeaker {
             reason = err_msg;
         }
         if reason.is_empty() {
-            reason = "HomeSpeaker printed no volume (is it version 1.9 or later?)".to_string();
+            reason =
+                "Vitruvian Speaker printed no volume (is it version 1.9 or later?)".to_string();
         }
-        HomeSpeakerVolume {
+        VitruvianSpeakerVolume {
             reason,
             ..Default::default()
         }
@@ -2158,7 +2168,7 @@ impl HomeSpeaker {
             Ok(v) => v,
             Err(e) => return HttpResponse::error(400, &e),
         };
-        let body = match HomeSpeakerUpdate::from_json(&val) {
+        let body = match VitruvianSpeakerUpdate::from_json(&val) {
             Ok(u) => u,
             Err(e) => return HttpResponse::error(400, &e),
         };
@@ -2171,7 +2181,7 @@ impl HomeSpeaker {
         let mut verified = Vec::new();
         match self.apply_checked(body, &mut verified) {
             Ok(changed) => {
-                log_act("homespeaker", &changed);
+                log_act("speaker", &changed);
                 let mut st = self.state_checked(&mut verified);
                 st.phone_connected = phone.connected();
                 HttpResponse::json(200, &st.to_json())
@@ -2209,7 +2219,10 @@ impl HomeSpeaker {
         if !file_exists(&p.binary) {
             return HttpResponse::error(
                 409,
-                &format!("HomeSpeaker is not installed at {}", p.binary.display()),
+                &format!(
+                    "Vitruvian Speaker is not installed at {}",
+                    p.binary.display()
+                ),
             );
         }
         let is_replay = replay || !replay_id.is_empty();
@@ -2223,13 +2236,13 @@ impl HomeSpeaker {
                 Err(VersionProblem::Unreadable(e)) => {
                     return HttpResponse::error(
                         409,
-                        &format!("Could not read the Home Speaker version: {e}"),
+                        &format!("Could not read the Vitruvian Speaker version: {e}"),
                     )
                 }
             }
         }
         if !replay_id.is_empty() {
-            // The history is Home Speaker's: ask it, do not read its file.
+            // The history is Vitruvian Speaker's: ask it, do not read its file.
             let doc = match self.fetch_state_doc(&p, &mut Vec::new()) {
                 Ok(d) => d,
                 Err(e) => return HttpResponse::error(409, &e),
@@ -2258,7 +2271,7 @@ impl HomeSpeaker {
         } else {
             format!("say {text}")
         };
-        log_act("homespeaker", &log_label);
+        log_act("speaker", &log_label);
 
         let run = self.say.as_ref().unwrap_or(&self.run);
         let bin_str = p.binary.to_string_lossy().into_owned();
@@ -2315,7 +2328,7 @@ impl HomeSpeaker {
                 &phone_say_response_json(false, false, false, "no phone connected", ""),
             );
         }
-        // What the phone was not told, Home Speaker's settings say.
+        // What the phone was not told, Vitruvian Speaker's settings say.
         let doc = self
             .fetch_state_doc(&self.active_program(), &mut Vec::new())
             .ok();
@@ -2347,7 +2360,7 @@ impl HomeSpeaker {
             "headphones_only".to_string(),
             JsonValue::Bool(headphones_only),
         );
-        log_act("homespeaker", &format!("phone-say {text}"));
+        log_act("speaker", &format!("phone-say {text}"));
 
         let res = match phone.dispatch(
             "phone.speak",
@@ -2438,13 +2451,13 @@ impl HomeSpeaker {
             }
             (None, Some(m)) => CliAction::Mute(m).args(),
         };
-        log_act("homespeaker", &format!("volume {}", args.join(" ")));
+        log_act("speaker", &format!("volume {}", args.join(" ")));
         let v = self.run_volume(&args);
         HttpResponse::json(200, &v.to_json())
     }
 }
 
-impl Default for HomeSpeaker {
+impl Default for VitruvianSpeaker {
     fn default() -> Self {
         Self::new()
     }
@@ -2494,7 +2507,7 @@ pub fn run_capturing_exit(
 
 /// The program the helper talks to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSpeakerProgram {
+pub struct VitruvianSpeakerProgram {
     pub door: String,
     pub binary: PathBuf,
 }
@@ -2505,7 +2518,7 @@ enum VersionProblem {
     Unreadable(String),
 }
 
-/// The version in `HomeSpeaker --version`'s answer ("HomeSpeaker 1.41.0").
+/// The version in `VitruvianSpeaker --version`'s answer ("Vitruvian Speaker 1.41.0").
 fn parse_version_output(out: &str) -> Option<String> {
     let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
     let token = line.split_whitespace().last()?.trim_start_matches('v');
@@ -2556,9 +2569,9 @@ fn doc_obj<'a>(o: &'a JsonObject, key: &str) -> Option<&'a JsonObject> {
     o.get(key).and_then(|v| v.as_object())
 }
 
-fn doc_entry(o: &JsonObject) -> Option<HomeSpeakerLast> {
+fn doc_entry(o: &JsonObject) -> Option<VitruvianSpeakerLast> {
     let at = Timestamp::parse_rfc3339(o.get("at")?.as_str()?).ok()?;
-    Some(HomeSpeakerLast {
+    Some(VitruvianSpeakerLast {
         id: doc_str(o, "id"),
         text: doc_str(o, "text"),
         target: doc_str(o, "target"),
@@ -2609,12 +2622,12 @@ impl<'a> DocSettings<'a> {
     }
 }
 
-fn doc_networks(chat: &JsonObject, key: &str) -> Vec<HomeSpeakerBeeperNetwork> {
+fn doc_networks(chat: &JsonObject, key: &str) -> Vec<VitruvianSpeakerBeeperNetwork> {
     let mut out = Vec::new();
     if let Some(rows) = chat.get(key).and_then(|v| v.as_array()) {
         for row in rows {
             if let Some(o) = row.as_object() {
-                out.push(HomeSpeakerBeeperNetwork {
+                out.push(VitruvianSpeakerBeeperNetwork {
                     key: doc_str(o, "key"),
                     name: doc_str(o, "name"),
                     state: doc_str(o, "state"),
@@ -2626,12 +2639,12 @@ fn doc_networks(chat: &JsonObject, key: &str) -> Vec<HomeSpeakerBeeperNetwork> {
     out
 }
 
-/// Maps Home Speaker's `--state` document (contract v1) onto the fields the phone reads.
+/// Maps Vitruvian Speaker's `--state` document (contract v1) onto the fields the phone reads.
 fn map_state_doc(
     doc: &JsonValue,
-    program: &HomeSpeakerProgram,
-    mut st: HomeSpeakerState,
-) -> HomeSpeakerState {
+    program: &VitruvianSpeakerProgram,
+    mut st: VitruvianSpeakerState,
+) -> VitruvianSpeakerState {
     let Some(d) = doc.as_object() else {
         return st;
     };
@@ -2659,7 +2672,7 @@ fn map_state_doc(
             .get("config_problem")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("HomeSpeaker has not been set up on this Mac")
+            .unwrap_or("Vitruvian Speaker has not been set up on this Mac")
             .to_string();
         return st;
     }
@@ -2722,7 +2735,7 @@ fn map_state_doc(
             let selected = h
                 .get_opt_bool("selected")
                 .unwrap_or_else(|| !st.structure_id.is_empty() && id == st.structure_id);
-            st.homes.push(HomeSpeakerHome {
+            st.homes.push(VitruvianSpeakerHome {
                 id,
                 name: doc_str(h, "name"),
                 selected,
@@ -2730,7 +2743,7 @@ fn map_state_doc(
         }
     }
     if let Some(q) = doc_obj(d, "quiet_hours") {
-        st.quiet_hours = HomeSpeakerQuiet {
+        st.quiet_hours = VitruvianSpeakerQuiet {
             enabled: doc_bool(q, "enabled"),
             start: doc_str(q, "start"),
             end: doc_str(q, "end"),
@@ -2746,7 +2759,7 @@ fn map_state_doc(
 
     if let Some(speakers) = d.get("speakers").and_then(|v| v.as_array()) {
         for sp in speakers.iter().filter_map(|v| v.as_object()) {
-            st.targets.push(HomeSpeakerTarget {
+            st.targets.push(VitruvianSpeakerTarget {
                 key: doc_str(sp, "key"),
                 name: doc_str(sp, "name"),
                 room: doc_str(sp, "room"),
@@ -2758,7 +2771,7 @@ fn map_state_doc(
     }
     if let Some(voices) = d.get("available_voices").and_then(|v| v.as_array()) {
         for v in voices.iter().filter_map(|v| v.as_object()) {
-            st.available_voices.push(HomeSpeakerVoice {
+            st.available_voices.push(VitruvianSpeakerVoice {
                 id: doc_str(v, "id"),
                 name: doc_str(v, "name"),
                 lang: doc_str(v, "language"),
@@ -2767,7 +2780,7 @@ fn map_state_doc(
     }
     if let Some(voices) = d.get("custom_voices").and_then(|v| v.as_array()) {
         for v in voices.iter().filter_map(|v| v.as_object()) {
-            st.custom_voices.push(HomeSpeakerCustomVoice {
+            st.custom_voices.push(VitruvianSpeakerCustomVoice {
                 id: doc_str(v, "id"),
                 name: doc_str(v, "name"),
             });
@@ -2805,7 +2818,7 @@ fn map_state_doc(
     if let Some(hooks) = doc_obj(d, "hooks") {
         for key in ["claude_code", "antigravity", "opencode"] {
             if let Some(h) = doc_obj(hooks, key) {
-                st.agents.push(HomeSpeakerAgentHook {
+                st.agents.push(VitruvianSpeakerAgentHook {
                     agent: doc_str(h, "display_name"),
                     agent_slug: doc_str(h, "agent"),
                     hook_state: doc_str(h, "hook_state"),
@@ -2818,7 +2831,7 @@ fn map_state_doc(
         }
     }
     st.legacy_launch_agent = doc_bool(d, "legacy_launch_agent");
-    st.home_speaker_version = doc_str(d, "home_speaker_version");
+    st.speaker_version = doc_str(d, "speaker_version");
     if let Some(rows) = d.get("recent").and_then(|v| v.as_array()) {
         st.recent = rows
             .iter()
@@ -2833,14 +2846,14 @@ fn map_state_doc(
     st
 }
 
-/// Converts a raw `--state --json` document string into the helper's `GET /v1/homespeaker` JSON.
+/// Converts a raw `--state --json` document string into the helper's `GET /v1/speaker` JSON.
 pub fn state_from_doc_json(doc_json: &str) -> Result<String, String> {
     let doc = JsonValue::parse(doc_json.trim()).map_err(|e| e.to_string())?;
-    let program = HomeSpeakerProgram {
+    let program = VitruvianSpeakerProgram {
         door: "app".to_string(),
-        binary: PathBuf::from(HOME_SPEAKER_BINARY),
+        binary: PathBuf::from(SPEAKER_BINARY),
     };
-    let st = map_state_doc(&doc, &program, HomeSpeakerState::default());
+    let st = map_state_doc(&doc, &program, VitruvianSpeakerState::default());
     Ok(st.to_json().to_json_string())
 }
 
@@ -2849,7 +2862,7 @@ pub fn state_from_doc_json(doc_json: &str) -> Result<String, String> {
 pub struct OpPlan {
     /// Settings, secrets, snooze, networks, imports: one batch.
     pub plain: Vec<JsonValue>,
-    /// `agentHook` changes files outside Home Speaker's settings, so it goes alone.
+    /// `agentHook` changes files outside Vitruvian Speaker's settings, so it goes alone.
     pub hook: Option<JsonValue>,
     /// `switchTo` goes alone and last.
     pub switch: Option<JsonValue>,
@@ -2897,7 +2910,7 @@ fn agent_hook_op(action: &str) -> Result<JsonValue, ApplyError> {
     let act = action.trim();
     let unsupported = || {
         ApplyError::BadRequest(format!(
-            "{act:?} is not an agent_hook_action Home Speaker knows"
+            "{act:?} is not an agent_hook_action Vitruvian Speaker knows"
         ))
     };
     let norm = act.to_lowercase().replace('_', "-");
@@ -2934,16 +2947,16 @@ fn agent_hook_op(action: &str) -> Result<JsonValue, ApplyError> {
 
 /// Turns the phone's update into `--apply` operations. No checking of values here: Home
 /// Speaker's own rules are the one rule, and it answers a refusal.
-pub fn plan_ops(u: &HomeSpeakerUpdate) -> Result<OpPlan, ApplyError> {
+pub fn plan_ops(u: &VitruvianSpeakerUpdate) -> Result<OpPlan, ApplyError> {
     plan_ops_with(u, None, Some(MIN_DOOR_COPY_VERSION))
 }
 
-/// `plan_ops`, given the custom OAuth client id Home Speaker has now (for an update that
-/// carries a secret without an id) and the active Home Speaker version (when gating `copy`).
+/// `plan_ops`, given the custom OAuth client id Vitruvian Speaker has now (for an update that
+/// carries a secret without an id) and the active Vitruvian Speaker version (when gating `copy`).
 pub fn plan_ops_with(
-    u: &HomeSpeakerUpdate,
+    u: &VitruvianSpeakerUpdate,
     current_oauth_id: Option<&str>,
-    home_speaker_version: Option<&str>,
+    speaker_version: Option<&str>,
 ) -> Result<OpPlan, ApplyError> {
     if u.copy.is_some() && u.active_door.is_none() {
         return Err(ApplyError::BadRequest(
@@ -2951,10 +2964,10 @@ pub fn plan_ops_with(
         ));
     }
     if u.copy == Some(true) {
-        let have = home_speaker_version.unwrap_or("");
+        let have = speaker_version.unwrap_or("");
         if !supports_door_copy(have) {
             return Err(ApplyError::Conflict(format!(
-                "copy requires Home Speaker {MIN_DOOR_COPY_VERSION} or newer"
+                "copy requires Vitruvian Speaker {MIN_DOOR_COPY_VERSION} or newer"
             )));
         }
     }
@@ -3168,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_home_speaker_voice_name() {
+    fn test_speaker_voice_name() {
         for (id, want) in [
             ("com.apple.siri.natural.Aaron", "Aaron"),
             ("com.apple.ttsbundle.siri_Aaron_en-US_premium", "Aaron"),
@@ -3185,7 +3198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_home_speaker_say_runs_as_a_person() {
+    fn test_speaker_say_runs_as_a_person() {
         let env = vec![
             "PATH=/usr/bin".to_string(),
             "CLAUDECODE=1".to_string(),
@@ -3202,17 +3215,17 @@ mod tests {
     }
 
     #[test]
-    fn test_home_speaker_is_a_known_tool_resolved_by_bundle_not_path() {
-        assert!(KNOWN_TOOLS.contains(&"homespeaker"));
-        let tools = crate::sampler::tool_presence(&["homespeaker"]);
-        let got = tools.tools.get("homespeaker").unwrap();
-        assert_eq!(got.path, HOME_SPEAKER_BINARY);
-        assert_eq!(got.available, Path::new(HOME_SPEAKER_BINARY).exists());
+    fn test_speaker_is_a_known_tool_resolved_by_bundle_not_path() {
+        assert!(KNOWN_TOOLS.contains(&"speaker"));
+        let tools = crate::sampler::tool_presence(&["speaker"]);
+        let got = tools.tools.get("speaker").unwrap();
+        assert_eq!(got.path, SPEAKER_BINARY);
+        assert_eq!(got.available, Path::new(SPEAKER_BINARY).exists());
     }
 
     // ---- The program answers; the helper relays (golden `--state` document, fake runner). ----
 
-    const GOLDEN_STATE_PATH: &str = "apps/desktop/home-speaker/testdata/state_v1.json";
+    const GOLDEN_STATE_PATH: &str = "apps/desktop/vitruvian-speaker/testdata/state_v1.json";
 
     fn golden_state() -> String {
         fs::read_to_string(GOLDEN_STATE_PATH).expect("golden state_v1.json is in the test data")
@@ -3220,18 +3233,18 @@ mod tests {
 
     type CallLog = Arc<Mutex<Vec<Vec<String>>>>;
 
-    /// A helper whose "Home Speaker" is a closure: nothing real is ever run. `handler` sees the
+    /// A helper whose "Vitruvian Speaker" is a closure: nothing real is ever run. `handler` sees the
     /// arguments of every program call (`--version`, `--state`, `--apply`, ...).
     fn relay_speaker(
         prefix: &str,
         handler: impl Fn(&str, &[String]) -> Result<(String, String), String> + Send + Sync + 'static,
-    ) -> (HomeSpeaker, PathBuf, CallLog) {
+    ) -> (VitruvianSpeaker, PathBuf, CallLog) {
         let dir = temp_dir(prefix);
-        let bin = dir.join("HomeSpeaker");
+        let bin = dir.join("VitruvianSpeaker");
         fs::write(&bin, b"#!/bin/sh\n").unwrap();
         let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
         let calls_c = calls.clone();
-        let mut h = HomeSpeaker::new();
+        let mut h = VitruvianSpeaker::new();
         h.binary = bin.clone();
         h.door_path = dir.join("speaker_door.json");
         h.run_capture = None;
@@ -3255,7 +3268,9 @@ mod tests {
         state: String,
     ) -> impl Fn(&str, &[String]) -> Result<(String, String), String> {
         move |_name: &str, args: &[String]| match args {
-            [f] if f == "--version" => Ok((format!("HomeSpeaker {version}\n"), String::new())),
+            [f] if f == "--version" => {
+                Ok((format!("Vitruvian Speaker {version}\n"), String::new()))
+            }
             [a, b] if a == "--state" && b == "--json" => Ok((state.clone(), String::new())),
             _ => Err(format!("unexpected arguments: {args:?}")),
         }
@@ -3294,7 +3309,7 @@ mod tests {
         assert_eq!(b.get_str("active_door"), "app");
         assert!(b.get_bool("extension_installed"));
         assert!(!b.get_bool("phone_connected"));
-        assert_eq!(b.get_str("home_speaker_version"), "1.19.1");
+        assert_eq!(b.get_str("speaker_version"), "1.19.1");
         assert!(!b.get_bool("legacy_launch_agent"));
         // Settings, by key.
         assert!(b.get_bool("enabled"));
@@ -3427,7 +3442,10 @@ mod tests {
         assert!(!b.get_bool("available"));
         assert!(b.get_bool("installed"));
         let reason = b.get_str("reason");
-        assert!(reason.starts_with("Update Home Speaker on "), "{reason}");
+        assert!(
+            reason.starts_with("Update Vitruvian Speaker on "),
+            "{reason}"
+        );
         assert!(reason.ends_with("(have 1.40.0, need 1.41.0)"), "{reason}");
         assert_eq!(
             calls.lock().unwrap().clone(),
@@ -3445,7 +3463,7 @@ mod tests {
         assert!(!version_at_least("1.9.9", "1.41.0"));
         assert!(!version_at_least("1.39.99", "1.41.0"));
         assert_eq!(
-            parse_version_output("HomeSpeaker 1.41.0\n").as_deref(),
+            parse_version_output("Vitruvian Speaker 1.41.0\n").as_deref(),
             Some("1.41.0")
         );
         assert_eq!(parse_version_output("v1.41.2").as_deref(), Some("1.41.2"));
@@ -3456,7 +3474,7 @@ mod tests {
     #[test]
     fn test_get_missing_program_keeps_the_not_installed_answer() {
         let (h, dir, calls) = relay_speaker("missing", state_answering("1.41.0", golden_state()));
-        fs::remove_file(dir.join("HomeSpeaker")).unwrap();
+        fs::remove_file(dir.join("VitruvianSpeaker")).unwrap();
         let b = body_of(&h.handle_get(&PhoneBridge::new()));
         assert!(!b.get_bool("available") && !b.get_bool("installed"));
         assert!(
@@ -3473,8 +3491,8 @@ mod tests {
     #[test]
     fn test_get_state_timeout_and_bad_json_are_clear_errors_not_crashes() {
         let (h, _d, _c) = relay_speaker("state_timeout", |_n, args| match args {
-            [f] if f == "--version" => Ok(("HomeSpeaker 1.41.0".to_string(), String::new())),
-            _ => Err("HomeSpeaker: no answer within 15s".to_string()),
+            [f] if f == "--version" => Ok(("Vitruvian Speaker 1.41.0".to_string(), String::new())),
+            _ => Err("Vitruvian Speaker: no answer within 15s".to_string()),
         });
         let b = body_of(&h.handle_get(&PhoneBridge::new()));
         assert!(!b.get_bool("available") && b.get_bool("installed"));
@@ -3508,7 +3526,7 @@ mod tests {
         assert!(!b.get_bool("available"));
         assert!(b
             .get_str("reason")
-            .contains("Could not read the Home Speaker version"));
+            .contains("Could not read the Vitruvian Speaker version"));
     }
 
     #[test]
@@ -3525,7 +3543,7 @@ mod tests {
 
     #[test]
     fn test_capturing_runner_keeps_stdout_of_a_refusal_and_reports_a_timeout() {
-        // /bin/sh stands in for any program: this is about the runner, not Home Speaker.
+        // /bin/sh stands in for any program: this is about the runner, not Vitruvian Speaker.
         let args = vec![
             "-c".to_string(),
             "echo '{\"ok\":false}'; exit 1".to_string(),
@@ -3542,7 +3560,7 @@ mod tests {
     // ---- POST: the update becomes `--apply` operations. ----
 
     fn plan_for(body: &str) -> Result<OpPlan, ApplyError> {
-        plan_ops(&HomeSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap()).unwrap())
+        plan_ops(&VitruvianSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap()).unwrap())
     }
 
     fn plain_json(body: &str) -> String {
@@ -3583,7 +3601,7 @@ mod tests {
             req_obj.insert("settings", JsonValue::Object(settings_obj));
             let body = JsonValue::Object(req_obj).to_json_string();
 
-            let resp = h.handle_set(&post_req("/v1/homespeaker", &body), &phone);
+            let resp = h.handle_set(&post_req("/v1/speaker", &body), &phone);
             assert_eq!(
                 resp.status,
                 200,
@@ -3603,10 +3621,7 @@ mod tests {
         // Unknown catalog keys are rejected with 400 and never forwarded to --apply.
         calls.lock().unwrap().clear();
         let bad = h.handle_set(
-            &post_req(
-                "/v1/homespeaker",
-                r#"{"settings":{"not_a_catalog_key":true}}"#,
-            ),
+            &post_req("/v1/speaker", r#"{"settings":{"not_a_catalog_key":true}}"#),
             &phone,
         );
         assert_eq!(bad.status, 400, "{}", bad.body_string());
@@ -3696,12 +3711,12 @@ mod tests {
       "agent": "opencode",
       "configured_by_instruction": false,
       "display_name": "OpenCode",
-      "hook_program": "/Users/j/.Trash/HomeSpeaker.app/Contents/MacOS/HomeSpeaker",
+      "hook_program": "/Users/j/.Trash/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker",
       "hook_state": "stale",
       "is_installed": false,
       "speaks_twice": false,
       "speaks_twice_warning": null,
-      "stale_command": "/Users/j/.Trash/HomeSpeaker.app/Contents/MacOS/HomeSpeaker --hook opencode"
+      "stale_command": "/Users/j/.Trash/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker --hook opencode"
     }"#,
         );
         let (h, _d, calls) = relay_speaker("passthrough_parity", state_and_apply(state));
@@ -3726,7 +3741,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             claude.get_str("hook_program"),
-            "/Applications/HomeSpeaker.app/Contents/MacOS/HomeSpeaker"
+            "/Applications/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker"
         );
         assert!(claude.get("stale_command").unwrap().is_null());
         let opencode = agents
@@ -3736,20 +3751,17 @@ mod tests {
         assert_eq!(opencode.get_str("hook_state"), "stale");
         assert_eq!(
             opencode.get_str("hook_program"),
-            "/Users/j/.Trash/HomeSpeaker.app/Contents/MacOS/HomeSpeaker"
+            "/Users/j/.Trash/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker"
         );
         assert_eq!(
             opencode.get_str("stale_command"),
-            "/Users/j/.Trash/HomeSpeaker.app/Contents/MacOS/HomeSpeaker --hook opencode"
+            "/Users/j/.Trash/Vitruvian Speaker.app/Contents/MacOS/VitruvianSpeaker --hook opencode"
         );
 
         // Door switch with copy: true emits "copy": true on switchTo.
         calls.lock().unwrap().clear();
         let sw = h.handle_set(
-            &post_req(
-                "/v1/homespeaker",
-                r#"{"active_door":"extension","copy":true}"#,
-            ),
+            &post_req("/v1/speaker", r#"{"active_door":"extension","copy":true}"#),
             &phone,
         );
         assert_eq!(sw.status, 200, "{}", sw.body_string());
@@ -3774,7 +3786,7 @@ mod tests {
         let (h_flags, _d2, flag_calls) =
             relay_speaker("home_id_flag", |_n, _a| Ok((String::new(), String::new())));
         let _ = h_flags.handle_set(
-            &post_req("/v1/homespeaker", r#"{"home_id":"home-structure-2"}"#),
+            &post_req("/v1/speaker", r#"{"home_id":"home-structure-2"}"#),
             &phone,
         );
         assert_eq!(
@@ -4104,7 +4116,7 @@ mod tests {
             ),
         ];
 
-        let raw = fs::read_to_string("apps/desktop/home-speaker/testdata/controls.json")
+        let raw = fs::read_to_string("apps/desktop/vitruvian-speaker/testdata/controls.json")
             .expect("controls.json must be in macagent_test data");
         let manifest = JsonValue::parse(&raw).expect("controls.json must parse as JSON");
         let entries = manifest
@@ -4120,7 +4132,7 @@ mod tests {
                     return Ok((String::new(), String::new()));
                 }
                 match args {
-                [f] if f == "--version" => Ok(("HomeSpeaker 1.41.0\n".to_string(), String::new())),
+                [f] if f == "--version" => Ok(("VitruvianSpeaker 1.41.0\n".to_string(), String::new())),
                 [a, b] if a == "--state" && b == "--json" => Ok((state.clone(), String::new())),
                 [a, b, _] if a == "--apply" && b == "--json" => {
                     Ok((format!(r#"{{"ok":true,"results":[],"state":{state}}}"#), String::new()))
@@ -4164,10 +4176,13 @@ mod tests {
             let resp = match endpoint {
                 ManifestEndpoint::Set(body) => {
                     // Also check pure planner directly for `--apply` ops so planner output is verified directly.
-                    let update = HomeSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap())
-                        .unwrap_or_else(|e| panic!("invalid HomeSpeakerUpdate for {id}: {e}"));
+                    let update =
+                        VitruvianSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap())
+                            .unwrap_or_else(|e| {
+                                panic!("invalid VitruvianSpeakerUpdate for {id}: {e}")
+                            });
                     if let ExpectedDispatch::Apply { op, must_contain } = expected {
-                        let plan = plan_ops_with(&update, None, Some(MIN_HOME_SPEAKER_VERSION))
+                        let plan = plan_ops_with(&update, None, Some(MIN_SPEAKER_VERSION))
                             .unwrap_or_else(|e| {
                                 panic!("plan_ops_with failed for {id}: {}", e.message())
                             });
@@ -4183,11 +4198,11 @@ mod tests {
                             "plan_ops_with for {id} (via {via}) did not produce op={op:?} with {must_contain}: got {all_ops:?}"
                         );
                     }
-                    h.handle_set(&post_req("/v1/homespeaker", body), &phone)
+                    h.handle_set(&post_req("/v1/speaker", body), &phone)
                 }
-                ManifestEndpoint::Say(body) => h.handle_say(&post_req("/v1/homespeaker/say", body)),
+                ManifestEndpoint::Say(body) => h.handle_say(&post_req("/v1/speaker/say", body)),
                 ManifestEndpoint::Volume(body) => {
-                    h.handle_set_volume(&post_req("/v1/homespeaker/volume", body))
+                    h.handle_set_volume(&post_req("/v1/speaker/volume", body))
                 }
             };
             assert_eq!(
@@ -4443,7 +4458,7 @@ mod tests {
     fn test_post_runs_version_then_apply_with_the_exact_envelope_then_state() {
         let (h, _d, calls) = relay_speaker("post_exact", state_and_apply(golden_state()));
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":false,"poll_interval":45}"#),
+            &post_req("/v1/speaker", r#"{"enabled":false,"poll_interval":45}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200, "{}", resp.body_string());
@@ -4471,7 +4486,7 @@ mod tests {
     fn test_mixed_update_sends_plain_then_hook_then_switch_and_stops_at_the_first_failure() {
         let body = r#"{"active_door":"extension","agent_hook_action":"install:claude-code","enabled":false,"default_target":"kitchen"}"#;
         let (h, _d, calls) = relay_speaker("post_mixed", state_and_apply(golden_state()));
-        let resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         assert_eq!(resp.status, 200, "{}", resp.body_string());
         assert_eq!(
             applies(&calls),
@@ -4495,7 +4510,7 @@ mod tests {
                 _ => seen(name, args),
             }
         });
-        let resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         assert_eq!(resp.status, 400);
         assert!(resp
             .body_string()
@@ -4511,7 +4526,7 @@ mod tests {
         // The plain batch is refused: neither the hook nor the switch is sent.
         let (h, _d, calls) = relay_speaker("post_plain_fails", |_n, args| {
             match args.first().map(String::as_str) {
-                Some("--version") => Ok(("HomeSpeaker 1.41.0".to_string(), String::new())),
+                Some("--version") => Ok(("Vitruvian Speaker 1.41.0".to_string(), String::new())),
                 _ => refusal(
                     "invalid_choice",
                     "speech_length must be one of headline, summary, full",
@@ -4519,7 +4534,7 @@ mod tests {
                 ),
             }
         });
-        let resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         assert_eq!(resp.status, 400);
         assert!(resp.body_string().contains("speech_length must be one of"));
         assert_eq!(applies(&calls).len(), 1);
@@ -4536,7 +4551,7 @@ mod tests {
                 }
             });
             h.handle_set(
-                &post_req("/v1/homespeaker", r#"{"enabled":true}"#),
+                &post_req("/v1/speaker", r#"{"enabled":true}"#),
                 &PhoneBridge::new(),
             )
         };
@@ -4567,7 +4582,7 @@ mod tests {
     fn test_post_to_an_old_program_answers_the_update_sentence_and_never_runs_apply() {
         let (h, _d, calls) = relay_speaker("post_old", state_answering("1.40.0", golden_state()));
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":true}"#),
+            &post_req("/v1/speaker", r#"{"enabled":true}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 409);
@@ -4579,9 +4594,9 @@ mod tests {
 
         let (h, dir, calls) =
             relay_speaker("post_missing", state_answering("1.41.0", golden_state()));
-        fs::remove_file(dir.join("HomeSpeaker")).unwrap();
+        fs::remove_file(dir.join("VitruvianSpeaker")).unwrap();
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":true}"#),
+            &post_req("/v1/speaker", r#"{"enabled":true}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 409);
@@ -4601,7 +4616,7 @@ mod tests {
             )
             .unwrap();
         };
-        // The choice file said "app", but Home Speaker says the extension is chosen.
+        // The choice file said "app", but Vitruvian Speaker says the extension is chosen.
         let ext_root = temp_dir("retry_ext");
         let ext = ext_root.join("tool");
         fs::write(&ext, b"#!/bin/sh\n").unwrap();
@@ -4619,7 +4634,7 @@ mod tests {
         });
         door(&dir, "app", &ext);
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":false}"#),
+            &post_req("/v1/speaker", r#"{"enabled":false}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200, "{}", resp.body_string());
@@ -4652,7 +4667,7 @@ mod tests {
         });
         door(&dir, "app", &ext);
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":false}"#),
+            &post_req("/v1/speaker", r#"{"enabled":false}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 409);
@@ -4664,8 +4679,7 @@ mod tests {
     #[test]
     fn test_direct_program_commands_keep_their_flags_and_touch_no_files() {
         let (h, dir, calls) = relay_speaker("flags", |_n, _a| Ok((String::new(), String::new())));
-        let post =
-            |body: &str| h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let post = |body: &str| h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         // Each answers from a closure that returns no state, so only the flags matter here.
         for (body, expect) in [
             (r#"{"sign_out":true}"#, vec!["--sign-out"]),
@@ -4701,7 +4715,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         files.sort();
-        assert_eq!(files, vec!["HomeSpeaker"], "the helper wrote nothing");
+        assert_eq!(files, vec!["VitruvianSpeaker"], "the helper wrote nothing");
     }
 
     #[test]
@@ -4725,7 +4739,7 @@ mod tests {
             seen(name, args)
         });
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"preview_voice":true}"#),
+            &post_req("/v1/speaker", r#"{"preview_voice":true}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200, "{}", resp.body_string());
@@ -4756,7 +4770,7 @@ mod tests {
             }
         });
         let r = h.handle_say(&post_req(
-            "/v1/homespeaker/say",
+            "/v1/speaker/say",
             r#"{"replay_id":"00000000-0000-0000-0000-000000000001"}"#,
         ));
         assert_eq!(r.status, 200, "{}", r.body_string());
@@ -4779,7 +4793,7 @@ mod tests {
             "a replay is kept out of the history"
         );
         let r = h.handle_say(&post_req(
-            "/v1/homespeaker/say",
+            "/v1/speaker/say",
             r#"{"text":"again","replay":true}"#,
         ));
         assert_eq!(r.status, 200);
@@ -4791,7 +4805,7 @@ mod tests {
                 "--no-history".to_string()
             ]
         );
-        let r = h.handle_say(&post_req("/v1/homespeaker/say", r#"{"replay_id":"nope"}"#));
+        let r = h.handle_say(&post_req("/v1/speaker/say", r#"{"replay_id":"nope"}"#));
         assert_eq!(r.status, 400);
         assert!(r.body_string().contains("no longer in the history"));
     }
@@ -4799,12 +4813,12 @@ mod tests {
     // ---- Speech, volume, sign-in, tool presence and the choice file. ----
 
     #[test]
-    fn test_home_speaker_say_runs_the_apps_own_say() {
+    fn test_speaker_say_runs_the_apps_own_say() {
         let (h, _d, calls) = relay_speaker("say", |_n, _a| {
             Ok(("sent to Lake Office display\n".to_string(), String::new()))
         });
         let resp = h.handle_say(&post_req(
-            "/v1/homespeaker/say",
+            "/v1/speaker/say",
             r#"{"text":"  dinner is ready  "}"#,
         ));
         assert_eq!(resp.status, 200);
@@ -4818,12 +4832,12 @@ mod tests {
             .get_str("output")
             .contains("sent to Lake Office display"));
 
-        let resp2 = h.handle_say(&post_req("/v1/homespeaker/say", r#"{"text":"   "}"#));
+        let resp2 = h.handle_say(&post_req("/v1/speaker/say", r#"{"text":"   "}"#));
         assert_eq!(resp2.status, 400);
     }
 
     #[test]
-    fn test_home_speaker_volume_read_and_change_and_refusals() {
+    fn test_speaker_volume_read_and_change_and_refusals() {
         let state_vol: Arc<Mutex<(i64, bool)>> = Arc::new(Mutex::new((40, false)));
         let state_c = state_vol.clone();
         let (h, _d, _calls) = relay_speaker("volume", move |_name, args| {
@@ -4844,18 +4858,21 @@ mod tests {
         });
 
         let r1 = h.handle_get_volume();
-        let v1 = HomeSpeakerVolume::from_json(&JsonValue::parse_bytes(&r1.body_bytes()).unwrap())
-            .unwrap();
+        let v1 =
+            VitruvianSpeakerVolume::from_json(&JsonValue::parse_bytes(&r1.body_bytes()).unwrap())
+                .unwrap();
         assert!(v1.available && v1.percent == 40 && v1.speaker == "Lake Office display");
 
-        let r2 = h.handle_set_volume(&post_req("/v1/homespeaker/volume", r#"{"percent":55}"#));
-        let v2 = HomeSpeakerVolume::from_json(&JsonValue::parse_bytes(&r2.body_bytes()).unwrap())
-            .unwrap();
+        let r2 = h.handle_set_volume(&post_req("/v1/speaker/volume", r#"{"percent":55}"#));
+        let v2 =
+            VitruvianSpeakerVolume::from_json(&JsonValue::parse_bytes(&r2.body_bytes()).unwrap())
+                .unwrap();
         assert_eq!(v2.percent, 55);
 
-        let r3 = h.handle_set_volume(&post_req("/v1/homespeaker/volume", r#"{"muted":true}"#));
-        let v3 = HomeSpeakerVolume::from_json(&JsonValue::parse_bytes(&r3.body_bytes()).unwrap())
-            .unwrap();
+        let r3 = h.handle_set_volume(&post_req("/v1/speaker/volume", r#"{"muted":true}"#));
+        let v3 =
+            VitruvianSpeakerVolume::from_json(&JsonValue::parse_bytes(&r3.body_bytes()).unwrap())
+                .unwrap();
         assert!(v3.muted);
 
         for bad in [
@@ -4864,7 +4881,7 @@ mod tests {
             r#"{"percent":101}"#,
             r#"{"percent":-1}"#,
         ] {
-            let rb = h.handle_set_volume(&post_req("/v1/homespeaker/volume", bad));
+            let rb = h.handle_set_volume(&post_req("/v1/speaker/volume", bad));
             assert_eq!(rb.status, 400);
         }
     }
@@ -4874,10 +4891,7 @@ mod tests {
         let (h, _d, calls) =
             relay_speaker("snooze_ascii", |_n, _a| Ok((String::new(), String::new())));
         let resp = h.handle_set(
-            &post_req(
-                "/v1/homespeaker",
-                r#"{"snooze_until":"2026é0123456789012345"}"#,
-            ),
+            &post_req("/v1/speaker", r#"{"snooze_until":"2026é0123456789012345"}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 400);
@@ -4899,19 +4913,16 @@ mod tests {
             launched_c.lock().unwrap().push(entry);
             Ok((String::new(), String::new()))
         }));
-        let bin = dir.join("HomeSpeaker").to_string_lossy().into_owned();
+        let bin = dir.join("VitruvianSpeaker").to_string_lossy().into_owned();
         let phone = PhoneBridge::new();
         assert_eq!(
-            h.handle_set(&post_req("/v1/homespeaker", r#"{"sign_in":true}"#), &phone)
+            h.handle_set(&post_req("/v1/speaker", r#"{"sign_in":true}"#), &phone)
                 .status,
             200
         );
         assert_eq!(
-            h.handle_set(
-                &post_req("/v1/homespeaker", r#"{"grant_chat":true}"#),
-                &phone
-            )
-            .status,
+            h.handle_set(&post_req("/v1/speaker", r#"{"grant_chat":true}"#), &phone)
+                .status,
             200
         );
         assert_eq!(
@@ -4922,24 +4933,21 @@ mod tests {
             ]
         );
         // Refuses cleanly when the program is gone.
-        fs::remove_file(dir.join("HomeSpeaker")).unwrap();
+        fs::remove_file(dir.join("VitruvianSpeaker")).unwrap();
         assert_eq!(
-            h.handle_set(&post_req("/v1/homespeaker", r#"{"sign_in":true}"#), &phone)
+            h.handle_set(&post_req("/v1/speaker", r#"{"sign_in":true}"#), &phone)
                 .status,
             400
         );
         assert_eq!(
-            h.handle_set(
-                &post_req("/v1/homespeaker", r#"{"grant_chat":true}"#),
-                &phone
-            )
-            .status,
+            h.handle_set(&post_req("/v1/speaker", r#"{"grant_chat":true}"#), &phone)
+                .status,
             400
         );
     }
 
     #[test]
-    fn test_home_speaker_sign_in_single_flight_guard_returns_409_while_busy() {
+    fn test_speaker_sign_in_single_flight_guard_returns_409_while_busy() {
         let (mut h, _d, _calls) =
             relay_speaker("single_flight", |_n, _a| Ok((String::new(), String::new())));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -4955,7 +4963,7 @@ mod tests {
         let h_bg = h.clone();
         let bg = std::thread::spawn(move || {
             let pb = PhoneBridge::new();
-            h_bg.handle_set(&post_req("/v1/homespeaker", r#"{"sign_in":true}"#), &pb)
+            h_bg.handle_set(&post_req("/v1/speaker", r#"{"sign_in":true}"#), &pb)
         });
         started_rx.recv().unwrap();
 
@@ -4966,7 +4974,7 @@ mod tests {
             r#"{"grant_chat":true}"#,
             r#"{"disconnect_chat":true}"#,
         ] {
-            let r_conflict = h.handle_set(&post_req("/v1/homespeaker", payload), &phone);
+            let r_conflict = h.handle_set(&post_req("/v1/speaker", payload), &phone);
             assert_eq!(r_conflict.status, 409);
             let err_val = JsonValue::parse(&r_conflict.body_string()).unwrap();
             assert_eq!(err_val.get_str("error"), SIGN_IN_ALREADY_RUNNING);
@@ -4975,10 +4983,7 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(bg.join().unwrap().status, 200);
         release_tx.send(()).unwrap();
-        let r_next = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"grant_chat":true}"#),
-            &phone,
-        );
+        let r_next = h.handle_set(&post_req("/v1/speaker", r#"{"grant_chat":true}"#), &phone);
         assert_eq!(r_next.status, 200);
     }
 
@@ -4996,7 +5001,7 @@ mod tests {
     #[test]
     fn test_choice_file_picks_which_program_the_helper_talks_to() {
         let (h, dir, _c) = relay_speaker("choice", |_n, _a| Ok((String::new(), String::new())));
-        let app = dir.join("HomeSpeaker");
+        let app = dir.join("VitruvianSpeaker");
         let ext = temp_dir("choice_ext").join("tool");
         fs::write(&ext, b"#!/bin/sh\n").unwrap();
 
@@ -5031,9 +5036,9 @@ mod tests {
     }
 
     #[test]
-    fn test_home_speaker_tool_counts_an_extension_only_mac() {
+    fn test_speaker_tool_counts_an_extension_only_mac() {
         let (h, dir, _c) = relay_speaker("tool_ext", |_n, _a| Ok((String::new(), String::new())));
-        fs::remove_file(dir.join("HomeSpeaker")).unwrap();
+        fs::remove_file(dir.join("VitruvianSpeaker")).unwrap();
         assert!(!h.tool().available);
         let ext_bin = temp_dir("hs_tool_ext").join("tool");
         fs::write(&ext_bin, b"#!/bin/sh\n").unwrap();
@@ -5041,7 +5046,7 @@ mod tests {
         let tool = h.tool();
         assert!(
             tool.available,
-            "an installed extension must make HomeSpeaker a present tool"
+            "an installed extension must make Vitruvian Speaker a present tool"
         );
         assert_eq!(tool.path, ext_bin.to_string_lossy());
     }
@@ -5061,7 +5066,7 @@ mod tests {
             }
             seen(name, args)
         });
-        let resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         assert_eq!(resp.status, 200, "{}", resp.body_string());
         assert_eq!(
             calls.lock().unwrap().clone(),
@@ -5094,7 +5099,7 @@ mod tests {
             }
             seen(name, args)
         });
-        let resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+        let resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
         assert_eq!(resp.status, 500);
         assert_eq!(
             applies(&calls),
@@ -5144,20 +5149,19 @@ mod tests {
             }
         });
         for (body, secret, want_summary) in cases {
-            let u = HomeSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap()).unwrap();
+            let u = VitruvianSpeakerUpdate::from_json(&JsonValue::parse(body).unwrap()).unwrap();
             let summary = h.apply(u).unwrap();
             assert_eq!(summary, want_summary);
             assert!(!summary.contains(secret));
 
-            let ok_resp = h.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+            let ok_resp = h.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
             assert_eq!(ok_resp.status, 200);
             assert!(
                 !ok_resp.body_string().contains(secret),
                 "secret leaked to 200 response: {secret}"
             );
 
-            let err_resp =
-                h_err.handle_set(&post_req("/v1/homespeaker", body), &PhoneBridge::new());
+            let err_resp = h_err.handle_set(&post_req("/v1/speaker", body), &PhoneBridge::new());
             assert_eq!(err_resp.status, 400);
             assert!(
                 !err_resp.body_string().contains(secret),
@@ -5183,9 +5187,9 @@ mod tests {
         let (h, dir, calls) = relay_speaker("probe_retry_old", move |name, args| {
             match args.first().map(String::as_str) {
                 Some("--version") if name == ext_name_c => {
-                    Ok(("HomeSpeaker 1.40.0\n".to_string(), String::new()))
+                    Ok(("Vitruvian Speaker 1.40.0\n".to_string(), String::new()))
                 }
-                Some("--version") => Ok(("HomeSpeaker 1.41.0\n".to_string(), String::new())),
+                Some("--version") => Ok(("Vitruvian Speaker 1.41.0\n".to_string(), String::new())),
                 Some("--apply") if name != ext_name_c => {
                     refusal("not_chosen", "The extension is chosen", Some("extension"))
                 }
@@ -5195,7 +5199,7 @@ mod tests {
         });
         door_file_naming(&dir, "app", &ext);
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":false}"#),
+            &post_req("/v1/speaker", r#"{"enabled":false}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 409);
@@ -5210,7 +5214,7 @@ mod tests {
         fs::remove_file(&ext).unwrap();
         let (h2, dir2, calls2) = relay_speaker("probe_retry_gone", move |_name, args| {
             match args.first().map(String::as_str) {
-                Some("--version") => Ok(("HomeSpeaker 1.41.0\n".to_string(), String::new())),
+                Some("--version") => Ok(("Vitruvian Speaker 1.41.0\n".to_string(), String::new())),
                 Some("--apply") => {
                     refusal("not_chosen", "The extension is chosen", Some("extension"))
                 }
@@ -5219,7 +5223,7 @@ mod tests {
         });
         door_file_naming(&dir2, "app", &ext);
         let resp2 = h2.handle_set(
-            &post_req("/v1/homespeaker", r#"{"enabled":false}"#),
+            &post_req("/v1/speaker", r#"{"enabled":false}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp2.status, 409);
@@ -5227,7 +5231,7 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_v1_tools_endpoint_reports_homespeaker_from_scratch_door_without_voice_cache() {
+    fn test_probe_v1_tools_endpoint_reports_speaker_from_scratch_door_without_voice_cache() {
         let (h, dir, _c) = relay_speaker("probe_v1_tools", |_n, _a| {
             Ok((String::new(), String::new()))
         });
@@ -5245,17 +5249,17 @@ mod tests {
             body_of(&resp)
                 .get("tools")
                 .unwrap()
-                .get("homespeaker")
+                .get("speaker")
                 .unwrap()
                 .clone()
         };
 
-        let app_path = dir.join("HomeSpeaker").to_string_lossy().into_owned();
+        let app_path = dir.join("VitruvianSpeaker").to_string_lossy().into_owned();
         let t1 = get_hs_tool(&srv);
         assert!(t1.get_bool("available"));
         assert_eq!(t1.get_str("path"), app_path);
 
-        fs::remove_file(dir.join("HomeSpeaker")).unwrap();
+        fs::remove_file(dir.join("VitruvianSpeaker")).unwrap();
         let t2 = get_hs_tool(&srv);
         assert!(!t2.get_bool("available"));
 
@@ -5271,7 +5275,7 @@ mod tests {
 
     /// Makes the scratch program answer with an exit status, too: `(stdout, exit code)` per call.
     fn with_exit_codes(
-        h: &mut HomeSpeaker,
+        h: &mut VitruvianSpeaker,
         f: impl Fn(&[String]) -> (String, i32) + Send + Sync + 'static,
     ) {
         h.run_capture = Some(Arc::new(move |_limit, _name, args| {
@@ -5284,7 +5288,7 @@ mod tests {
     fn test_oauth_secret_alone_uses_the_current_custom_client_id() {
         let (h, _d, calls) = relay_speaker("oauth_alone", state_and_apply(golden_state()));
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"oauth_client_secret":"new-secret"}"#),
+            &post_req("/v1/speaker", r#"{"oauth_client_secret":"new-secret"}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200, "{}", resp.body_string());
@@ -5296,7 +5300,7 @@ mod tests {
         );
         // Clearing the secret is the same thing with a blank one.
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"oauth_client_secret":""}"#),
+            &post_req("/v1/speaker", r#"{"oauth_client_secret":""}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200);
@@ -5309,7 +5313,7 @@ mod tests {
         );
         let (h, _d, calls) = relay_speaker("oauth_no_id", state_and_apply(none));
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"oauth_client_secret":"s"}"#),
+            &post_req("/v1/speaker", r#"{"oauth_client_secret":"s"}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 400);
@@ -5320,10 +5324,10 @@ mod tests {
     #[test]
     fn test_version_must_exit_zero_and_look_like_a_version() {
         for (out, code) in [
-            ("HomeSpeaker 1.41.0\n", 1),
-            ("HomeSpeaker 41\n", 0),
-            ("HomeSpeaker 1.41.0.1\n", 0),
-            ("usage: HomeSpeaker [options]\n", 0),
+            ("Vitruvian Speaker 1.41.0\n", 1),
+            ("Vitruvian Speaker 41\n", 0),
+            ("Vitruvian Speaker 1.41.0.1\n", 0),
+            ("usage: Vitruvian Speaker [options]\n", 0),
             ("", 0),
         ] {
             let (mut h, _d, calls) =
@@ -5334,12 +5338,12 @@ mod tests {
             assert!(!b.get_bool("available"));
             assert!(
                 b.get_str("reason")
-                    .contains("Could not read the Home Speaker version"),
+                    .contains("Could not read the Vitruvian Speaker version"),
                 "{code} {}",
                 b.get_str("reason")
             );
             let resp = h.handle_set(
-                &post_req("/v1/homespeaker", r#"{"enabled":true}"#),
+                &post_req("/v1/speaker", r#"{"enabled":true}"#),
                 &PhoneBridge::new(),
             );
             assert_eq!(resp.status, 500);
@@ -5357,7 +5361,7 @@ mod tests {
         let (mut h, _d, _c) =
             relay_speaker("state_exit", |_n, _a| Ok((String::new(), String::new())));
         with_exit_codes(&mut h, move |a| match a[0].as_str() {
-            "--version" => ("HomeSpeaker 1.41.0".to_string(), 0),
+            "--version" => ("Vitruvian Speaker 1.41.0".to_string(), 0),
             _ => (g.clone(), 1),
         });
         let b = body_of(&h.handle_get(&PhoneBridge::new()));
@@ -5373,12 +5377,12 @@ mod tests {
             let (mut h, _d, _c) =
                 relay_speaker("apply_exit", |_n, _a| Ok((String::new(), String::new())));
             with_exit_codes(&mut h, move |a| match a[0].as_str() {
-                "--version" => ("HomeSpeaker 1.41.0".to_string(), 0),
+                "--version" => ("Vitruvian Speaker 1.41.0".to_string(), 0),
                 "--apply" => (apply_out.to_string(), code),
                 _ => (g.clone(), 0),
             });
             h.handle_set(
-                &post_req("/v1/homespeaker", r#"{"enabled":true}"#),
+                &post_req("/v1/speaker", r#"{"enabled":true}"#),
                 &PhoneBridge::new(),
             )
         };
@@ -5413,12 +5417,12 @@ mod tests {
             }
         });
         for body in [r#"{"text":"again","replay":true}"#, r#"{"replay_id":"x"}"#] {
-            let r = h.handle_say(&post_req("/v1/homespeaker/say", body));
+            let r = h.handle_say(&post_req("/v1/speaker/say", body));
             assert_eq!(r.status, 409, "{body}");
             assert!(r.body_string().contains("(have 1.40.0, need 1.41.0)"));
         }
         assert!(!calls.lock().unwrap().iter().any(|c| c[0] == "--say"));
-        let r = h.handle_say(&post_req("/v1/homespeaker/say", r#"{"text":"hello"}"#));
+        let r = h.handle_say(&post_req("/v1/speaker/say", r#"{"text":"hello"}"#));
         assert_eq!(r.status, 200);
         assert_eq!(
             calls.lock().unwrap().last().unwrap(),
@@ -5473,7 +5477,7 @@ mod tests {
         let expected_settings = doc.get("settings").expect("state_v1 has settings");
         let got_settings = b
             .get("settings")
-            .expect("GET /v1/homespeaker must include settings");
+            .expect("GET /v1/speaker must include settings");
         assert_eq!(
             got_settings, expected_settings,
             "settings[] must pass through as is"
@@ -5541,7 +5545,7 @@ mod tests {
     fn test_probe_post_set_relays_catalog_and_empty_settings_array_omits_field() {
         let (h, _d, _calls) = relay_speaker("probe_post_catalog", state_and_apply(golden_state()));
         let resp = h.handle_set(
-            &post_req("/v1/homespeaker", r#"{"speech_length":"headline"}"#),
+            &post_req("/v1/speaker", r#"{"speech_length":"headline"}"#),
             &PhoneBridge::new(),
         );
         assert_eq!(resp.status, 200, "{}", resp.body_string());
@@ -5570,13 +5574,13 @@ mod tests {
     }
 
     #[test]
-    fn test_door_copy_is_gated_on_its_own_homespeaker_version() {
+    fn test_door_copy_is_gated_on_its_own_speaker_version() {
         assert!(supports_door_copy("1.41.0"));
         assert!(supports_door_copy("1.42.0"));
         assert!(!supports_door_copy("1.40.9"));
         assert!(!supports_door_copy(""));
 
-        let u = HomeSpeakerUpdate::from_json(
+        let u = VitruvianSpeakerUpdate::from_json(
             &JsonValue::parse(r#"{"active_door":"extension","copy":true}"#).unwrap(),
         )
         .unwrap();
@@ -5592,11 +5596,11 @@ mod tests {
             .contains(r#""copy":true"#));
     }
 
-    // ---- The helper no longer reads or writes Home Speaker's files. ----
+    // ---- The helper no longer reads or writes Vitruvian Speaker's files. ----
 
     #[test]
-    fn test_source_never_reads_or_writes_homespeakers_files_or_the_coding_agents_hooks() {
-        let src = include_str!("homespeaker.rs");
+    fn test_source_never_reads_or_writes_speakers_files_or_the_coding_agents_hooks() {
+        let src = include_str!("speaker.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap();
         // Strings that are pieces of the names, so this test does not trip over itself.
         let forbidden = [
@@ -5624,7 +5628,7 @@ mod tests {
         for word in &forbidden {
             assert!(
                 !prod.contains(word.as_str()),
-                "homespeaker.rs must not touch {word}: ask Home Speaker's --state / --apply"
+                "speaker.rs must not touch {word}: ask Vitruvian Speaker's --state / --apply"
             );
         }
         // The one file it still reads is the choice file.
