@@ -1,7 +1,7 @@
 # State
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state`.
 
 ## Interface
 - `[AgentClient.kt:ExecKind]`
@@ -41,4 +41,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - [Wire.kt:230]: `* intact (without port) so `http://10.0.2.2:7411` is not shortened to `10`.`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/...`

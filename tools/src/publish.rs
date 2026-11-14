@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn strip_version_prefix(tag: &str) -> &str {
-    let s = tag.strip_prefix("android-remote-v").unwrap_or(tag);
+    let s = tag.strip_prefix("vitruvian-remote-v").unwrap_or(tag);
     s.strip_prefix('v').unwrap_or(s)
 }
 
@@ -73,7 +73,7 @@ pub fn resolve_version(tag: &str, app_dir: &Path) -> String {
 
     if let Some(v) = version_from_manifest(
         &app_dir.join(".release-please-manifest.json"),
-        "apps/mobile/android-remote",
+        "apps/mobile/vitruvian-remote",
     ) {
         return v;
     }
@@ -132,8 +132,8 @@ pub fn run(args: &[String]) -> i32 {
     let version_env = env::var("VERSION").unwrap_or_default();
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let app_dir = if cwd.join("apps/mobile/android-remote/BUILD").is_file() {
-        let sub = cwd.join("apps/mobile/android-remote");
+    let app_dir = if cwd.join("apps/mobile/vitruvian-remote/BUILD").is_file() {
+        let sub = cwd.join("apps/mobile/vitruvian-remote");
         let _ = env::set_current_dir(&sub);
         sub
     } else {
@@ -177,7 +177,7 @@ pub fn run(args: &[String]) -> i32 {
         .args([
             "build",
             "--android_platforms=@rules_android//:arm64-v8a,@rules_android//:x86_64",
-            "//apps/mobile/android-remote:app",
+            "//apps/mobile/vitruvian-remote:app",
         ])
         .status();
 
@@ -204,7 +204,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    let bin_apk = PathBuf::from(&bazel_bin).join("apps/mobile/android-remote/app.apk");
+    let bin_apk = PathBuf::from(&bazel_bin).join("apps/mobile/vitruvian-remote/app.apk");
     if !bin_apk.is_file() {
         eprintln!(
             "Error: Expected APK output at {} not found",
@@ -295,8 +295,8 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn strip_android_remote_v_prefix() {
-        assert_eq!(strip_version_prefix("android-remote-v1.2.3"), "1.2.3");
+    fn strip_vitruvian_remote_v_prefix() {
+        assert_eq!(strip_version_prefix("vitruvian-remote-v1.2.3"), "1.2.3");
     }
 
     #[test]
@@ -310,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn strip_android_remote_v_then_v() {
-        assert_eq!(strip_version_prefix("android-remote-vv1.0.0"), "1.0.0");
+    fn strip_vitruvian_remote_v_then_v() {
+        assert_eq!(strip_version_prefix("vitruvian-remote-vv1.0.0"), "1.0.0");
     }
 
     #[test]
@@ -322,11 +322,11 @@ mod tests {
         let manifest = dir.path().join("manifest.json");
         fs::write(
             &manifest,
-            r#"{"apps/mobile/android-remote": "2.5.1", "other": "1.0.0"}"#,
+            r#"{"apps/mobile/vitruvian-remote": "2.5.1", "other": "1.0.0"}"#,
         )
         .unwrap();
         assert_eq!(
-            version_from_manifest(&manifest, "apps/mobile/android-remote"),
+            version_from_manifest(&manifest, "apps/mobile/vitruvian-remote"),
             Some("2.5.1".to_string())
         );
     }
@@ -338,7 +338,7 @@ mod tests {
         let manifest = dir.join("manifest.json");
         fs::write(&manifest, r#"{"other": "1.0.0"}"#).unwrap();
         assert_eq!(
-            version_from_manifest(&manifest, "apps/mobile/android-remote"),
+            version_from_manifest(&manifest, "apps/mobile/vitruvian-remote"),
             None
         );
         let _ = fs::remove_dir_all(&dir);
@@ -348,7 +348,7 @@ mod tests {
     fn manifest_file_missing() {
         let missing = PathBuf::from("/nonexistent/manifest.json");
         assert_eq!(
-            version_from_manifest(&missing, "apps/mobile/android-remote"),
+            version_from_manifest(&missing, "apps/mobile/vitruvian-remote"),
             None
         );
     }
@@ -377,7 +377,7 @@ mod tests {
     fn resolve_version_from_tag() {
         let dir = env::temp_dir().join("publish_test_resolve_tag");
         let _ = fs::create_dir_all(&dir);
-        assert_eq!(resolve_version("android-remote-v4.0.0", &dir), "4.0.0");
+        assert_eq!(resolve_version("vitruvian-remote-v4.0.0", &dir), "4.0.0");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -402,7 +402,7 @@ mod tests {
         let dir = env::temp_dir().join("publish_test_resolve_manifest");
         let _ = fs::create_dir_all(&dir);
         let manifest = dir.join(".release-please-manifest.json");
-        fs::write(&manifest, r#"{"apps/mobile/android-remote": "7.8.9"}"#).unwrap();
+        fs::write(&manifest, r#"{"apps/mobile/vitruvian-remote": "7.8.9"}"#).unwrap();
         assert_eq!(resolve_version("", &dir), "7.8.9");
         let _ = fs::remove_dir_all(&dir);
     }

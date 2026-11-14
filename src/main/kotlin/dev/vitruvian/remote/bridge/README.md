@@ -1,7 +1,7 @@
 # Bridge
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/bridge`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/bridge`.
 
 ## Interface
 - `[ApprovalReceiver.kt:ApprovalReceiver]`
@@ -27,4 +27,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - [Tools.kt:40]: `import android.net.Uri`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/bridge/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/bridge/...`

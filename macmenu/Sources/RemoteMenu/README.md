@@ -1,7 +1,7 @@
 # Remotemenu
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/Sources/RemoteMenu`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenu`.
 
 ## Interface
 - `[App.swift:VitruvianRemoteApp]`
@@ -17,4 +17,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/Sources/RemoteMenu/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenu/...`

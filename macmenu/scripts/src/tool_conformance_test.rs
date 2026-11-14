@@ -19,7 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Rust test runner for `//apps/mobile/android-remote/macmenu:tool_conformance_test`.
+//! Rust test runner for `//apps/mobile/vitruvian-remote/macmenu:tool_conformance_test`.
 
 use std::path::PathBuf;
 

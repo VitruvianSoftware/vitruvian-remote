@@ -2520,11 +2520,11 @@ public class DeriveTest {
     val main =
         stripKotlinComments(
             readRunfile(
-                "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/MainActivity.kt"))
+                "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/MainActivity.kt"))
     val remoteState =
         stripKotlinComments(
             readRunfile(
-                "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt"))
+                "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt"))
     assertFalse(
         "askForNotifications launch helper must be removed", main.contains("askForNotifications"))
     val launches = Regex("""\brequestNotifications\.launch\(""").findAll(main).count()
@@ -2852,7 +2852,7 @@ public class DeriveTest {
   public fun `catalog labels choices limits and shown come from payload and substitute This phone`() {
     val sources =
         VitruvianSpeakerWire.sources(
-            readRunfile("apps/mobile/android-remote/macagent/golden_speaker_v1.json"))
+            readRunfile("apps/mobile/vitruvian-remote/macagent/golden_speaker_v1.json"))
     val catalog = sources.catalog
 
     assertTrue(Derive.hasVitruvianSpeakerCatalog(available = true, catalog = catalog))
@@ -2952,13 +2952,13 @@ public class DeriveTest {
   public fun `deleted Vitruvian Speaker label constants choice lists and clamps stay out of phone sources`() {
     val files =
         listOf(
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/AgentClient.kt",
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/Derive.kt",
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt",
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/Wire.kt",
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/AgentClient.kt",
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/Derive.kt",
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt",
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/Wire.kt",
         ) +
             runfileKotlinFiles(
-                "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/screens")
+                "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/screens")
     val deletedSymbols =
         listOf(
             "speechLengths",
@@ -3185,14 +3185,14 @@ public class DeriveTest {
   public fun `setVitruvianSpeaker files its errors under real catalog keys`() {
     val catalogKeys =
         VitruvianSpeakerWire.sources(
-                readRunfile("apps/mobile/android-remote/macagent/golden_speaker_v1.json"))
+                readRunfile("apps/mobile/vitruvian-remote/macagent/golden_speaker_v1.json"))
             .catalog
             .settings
             .map { it.key }
             .toSet()
     val text =
         readRunfile(
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
     val block =
         text.substringAfter("    val key =\n        controlId").substringBefore("else -> what")
     val keys = Regex("""-> "([a-z][a-z_]+)"""").findAll(block).map { it.groupValues[1] }.toList()
@@ -3229,7 +3229,7 @@ public class DeriveTest {
 
   @Test
   public fun `every catalog setting in golden payload is either hand-placed or gets a generic row exactly once`() {
-    val goldenJson = readRunfile("apps/mobile/android-remote/macagent/golden_speaker_v1.json")
+    val goldenJson = readRunfile("apps/mobile/vitruvian-remote/macagent/golden_speaker_v1.json")
     val sources = VitruvianSpeakerWire.sources(goldenJson)
     val catalog = sources.catalog
     assertTrue(sources.genericSettings)
@@ -3238,7 +3238,7 @@ public class DeriveTest {
 
     val remoteText =
         readRunfile(
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
     assertFalse(
         "placedVitruvianSpeakerKeys constant must stay deleted",
         remoteText.contains("placedVitruvianSpeakerKeys"),
@@ -3352,7 +3352,7 @@ public class DeriveTest {
 
     val remoteText =
         readRunfile(
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
     assertFalse("dead manifestId plumbing must stay removed", remoteText.contains("manifestId"))
     assertFalse(
         "dead resolvedManifestId plumbing must stay removed",
@@ -3620,7 +3620,7 @@ public class DeriveTest {
     // while Poll interval and Skip messages I sent stay gated on anyChat.
     val remoteSrc =
         readRunfile(
-            "apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
+            "apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/state/RemoteState.kt")
     assertFalse(remoteSrc.contains("if (hs.enabled && claude != null"))
     assertFalse(remoteSrc.contains("if (hs.enabled && slack != null"))
     assertTrue(

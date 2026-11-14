@@ -1,7 +1,7 @@
 # Overlays
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/overlays`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/overlays`.
 
 ## Interface
 - `[ConfirmDialog.kt:ConfirmDialog]`
@@ -20,4 +20,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/overlays/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/overlays/...`

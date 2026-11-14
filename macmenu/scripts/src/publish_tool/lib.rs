@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Rust port of `apps/mobile/android-remote/macmenu/scripts/publish-tool.sh`.
+//! Rust port of `apps/mobile/vitruvian-remote/macmenu/scripts/publish-tool.sh`.
 
 use std::env;
 use std::fs;
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PKG: &str = "apps/mobile/android-remote/macmenu";
+pub const PKG: &str = "apps/mobile/vitruvian-remote/macmenu";
 pub const DEFAULT_REPO: &str = "VitruvianSoftware/vitruvian-core";
 pub const PROGRAMS: [&str; 2] = ["tool", "vitruvian-remote-agent"];
 pub const ARCHS: [&str; 2] = ["arm64", "x86_64"];
@@ -57,7 +57,7 @@ pub fn resolve_version(
     if let Some(tag) = tag_env {
         if !tag.is_empty() {
             return Some(
-                tag.strip_prefix("android-remote-v")
+                tag.strip_prefix("vitruvian-remote-v")
                     .unwrap_or(tag)
                     .to_string(),
             );
@@ -172,7 +172,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let tag = env::var("TAG").unwrap_or_default();
     let version_env = env::var("VERSION").ok();
-    let manifest_path = macmenu_dir.join("tool/vitruvian-tool.json");
+    let manifest_path = macmenu_dir.join("atrium-extension/vitruvian-tool.json");
     let manifest_content = fs::read_to_string(&manifest_path).unwrap_or_default();
 
     let version = match resolve_version(
@@ -443,11 +443,11 @@ mod tests {
     fn resolve_version_precedence() {
         let manifest = "{\n  \"version\": \"0.1.21\"\n}\n";
         assert_eq!(
-            resolve_version(Some("1.2.3"), Some("android-remote-v9.9.9"), manifest).as_deref(),
+            resolve_version(Some("1.2.3"), Some("vitruvian-remote-v9.9.9"), manifest).as_deref(),
             Some("1.2.3")
         );
         assert_eq!(
-            resolve_version(None, Some("android-remote-v0.2.0"), manifest).as_deref(),
+            resolve_version(None, Some("vitruvian-remote-v0.2.0"), manifest).as_deref(),
             Some("0.2.0")
         );
         assert_eq!(
@@ -512,17 +512,17 @@ mod tests {
     #[test]
     fn select_cquery_output_matches_exact_program_suffix() {
         let outputs = "\
-bazel-out/darwin_arm64-opt/bin/apps/mobile/android-remote/macmenu/built/remote/vitruvian-tool.json
-bazel-out/darwin_arm64-opt/bin/apps/mobile/android-remote/macmenu/built/remote/bin/tool
-bazel-out/darwin_arm64-opt/bin/apps/mobile/android-remote/macmenu/built/remote/bin/vitruvian-remote-agent
+bazel-out/darwin_arm64-opt/bin/apps/mobile/vitruvian-remote/macmenu/built/remote/vitruvian-tool.json
+bazel-out/darwin_arm64-opt/bin/apps/mobile/vitruvian-remote/macmenu/built/remote/bin/tool
+bazel-out/darwin_arm64-opt/bin/apps/mobile/vitruvian-remote/macmenu/built/remote/bin/vitruvian-remote-agent
 ";
         assert_eq!(
             select_cquery_output(outputs, "tool").as_deref(),
-            Some("bazel-out/darwin_arm64-opt/bin/apps/mobile/android-remote/macmenu/built/remote/bin/tool")
+            Some("bazel-out/darwin_arm64-opt/bin/apps/mobile/vitruvian-remote/macmenu/built/remote/bin/tool")
         );
         assert_eq!(
             select_cquery_output(outputs, "vitruvian-remote-agent").as_deref(),
-            Some("bazel-out/darwin_arm64-opt/bin/apps/mobile/android-remote/macmenu/built/remote/bin/vitruvian-remote-agent")
+            Some("bazel-out/darwin_arm64-opt/bin/apps/mobile/vitruvian-remote/macmenu/built/remote/bin/vitruvian-remote-agent")
         );
         assert!(select_cquery_output(outputs, "missing").is_none());
     }

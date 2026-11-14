@@ -1,7 +1,7 @@
 # Src
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/tools/src`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/tools/src`.
 
 ## Interface
 - `[boot_smoke.rs:rlocation]`
@@ -24,4 +24,4 @@ Component package providing implementation for `apps/mobile/android-remote/tools
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/tools/src/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/tools/src/...`

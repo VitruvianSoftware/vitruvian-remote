@@ -1,7 +1,7 @@
 # Remotemenucore
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/Sources/RemoteMenuCore`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenuCore`.
 
 ## Interface
 - `[AgentClient.swift:AgentClient]`
@@ -41,4 +41,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - [RemoteSettings.swift:197]: `args += ["--exec-dir", expanded]`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/Sources/RemoteMenuCore/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenuCore/...`

@@ -1,7 +1,7 @@
 # Src
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macagent/scripts/src`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macagent/scripts/src`.
 
 ## Interface
 - `[lib.rs:LABEL]`
@@ -34,4 +34,4 @@ Component package providing implementation for `apps/mobile/android-remote/macag
 - [lib.rs:397]: `let healthy = Command::new("curl")`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macagent/scripts/src/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macagent/scripts/src/...`

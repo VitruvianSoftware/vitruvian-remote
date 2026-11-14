@@ -6908,11 +6908,13 @@ public class RemoteState(
 
   public fun openInstallGuide() {
     if (openUrl?.invoke(INSTALL_GUIDE_URL) == true) {
-      log("info", "pairing · opened install guide (apps/mobile/android-remote/macagent/README.md)")
+      log(
+          "info",
+          "pairing · opened install guide (apps/mobile/vitruvian-remote/macagent/README.md)")
     } else {
       log(
           "warn",
-          "pairing · could not open browser; see apps/mobile/android-remote/macagent/README.md")
+          "pairing · could not open browser; see apps/mobile/vitruvian-remote/macagent/README.md")
     }
   }
 
@@ -8821,7 +8823,7 @@ public class RemoteState(
     const val LINK_REFUSED_PREFIX = "not paired (HTTP"
 
     const val INSTALL_GUIDE_URL =
-        "https://github.com/VitruvianSoftware/vitruvian-core/blob/main/apps/mobile/android-remote/macagent/README.md"
+        "https://github.com/VitruvianSoftware/vitruvian-core/blob/main/apps/mobile/vitruvian-remote/macagent/README.md"
 
     const val POINTER_HINT = "drag · tap · 2-finger scroll · hold to drag · 3-finger swipe"
 

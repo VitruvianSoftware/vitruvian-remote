@@ -53,7 +53,7 @@ There are two ways to install and run the agent:
 - **From source with Bazel (development):** Install the agent as a user LaunchAgent:
 
   ```sh
-  bazel run //apps/mobile/android-remote/macagent:install
+  bazel run //apps/mobile/vitruvian-remote/macagent:install
   ```
 
   This builds the daemon, copies the binary to `~/.local/bin/vitruvian-remote-agent`, and starts the background service.
@@ -68,7 +68,7 @@ You can pair your phone using a QR code or a six-digit code:
   2. On your Mac, enter the code in the Vitruvian Remote menu bar app, or run:
 
      ```sh
-     bazel run //apps/mobile/android-remote/macagent:pair -- 482917
+     bazel run //apps/mobile/vitruvian-remote/macagent:pair -- 482917
      ```
 
      That writes `~/.config/vitruvian-remote-agent/pair.json`. A running agent picks it up on its next request — nothing to restart.
@@ -148,12 +148,12 @@ can see from Activity Monitor.
 | `--exec-dir`        | *(empty = the agent's cwd, `~`)*   | working directory for console commands and macros; point it at the repo so `bazel run //:tidy` finds its workspace |
 | `--permission-wait` | `120s`                             | how long a Claude Code permission prompt waits for the phone before the Mac dialog shows; clamped to 5s–140s |
 
-`bazel run //apps/mobile/android-remote/macagent:install` passes every flag after `--` straight through into the
+`bazel run //apps/mobile/vitruvian-remote/macagent:install` passes every flag after `--` straight through into the
 LaunchAgent plist, so the v1.2 flags are installed the same way the older ones
 are (a leading `~` in a value is expanded, because launchd runs no shell):
 
 ```sh
-bazel run //apps/mobile/android-remote/macagent:install -- \
+bazel run //apps/mobile/vitruvian-remote/macagent:install -- \
   --kubeconfig ~/.kube/cluster.yaml --kube-context default \
   --ntfy-url https://ntfy.example.com --ntfy-topic vitruvian-remote-xxxxx \
   --ntfy-token-file ~/.config/vitruvian-remote-agent/ntfy-token \
@@ -487,14 +487,14 @@ whose own name contains a hyphen.
 ## Run it
 
 ```sh
-bazel run //apps/mobile/android-remote/macagent            # foreground, Ctrl-C to stop
+bazel run //apps/mobile/vitruvian-remote/macagent            # foreground, Ctrl-C to stop
 curl -s http://127.0.0.1:7411/v1/metrics | jq .
 ```
 
 Install as a login item for the current user (no sudo):
 
 ```sh
-bazel run //apps/mobile/android-remote/macagent:install
+bazel run //apps/mobile/vitruvian-remote/macagent:install
 ```
 
 That copies the built binary to `~/.local/bin`, writes a LaunchAgent to
@@ -565,7 +565,7 @@ What CI cannot check is the macOS commands themselves. Shell commands that requi
 plus `curl` is the rest of that check.
 
 ## Subdirectories & Boundaries
-- [metrics](./metrics/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/macagent/me...
-- [rs](./rs/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/macagent/rs.
-- [scripts](./scripts/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/macagent/sc...
+- [metrics](./metrics/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/macagent/me...
+- [rs](./rs/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/macagent/rs.
+- [scripts](./scripts/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/macagent/sc...
 

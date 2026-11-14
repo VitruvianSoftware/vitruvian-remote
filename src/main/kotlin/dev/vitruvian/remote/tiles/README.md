@@ -1,7 +1,7 @@
 # Tiles
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/tiles`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/tiles`.
 
 ## Interface
 - `[RemoteTiles.kt:SleepDisplayTile]`
@@ -15,4 +15,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/tiles/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/tiles/...`

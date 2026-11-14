@@ -1,7 +1,7 @@
 # Publish Tool
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/scripts/src/publish_tool`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/scripts/src/publish_tool`.
 
 ## Interface
 - `[lib.rs:PKG]`
@@ -27,4 +27,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/scripts/src/publish_tool/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/scripts/src/publish_tool/...`

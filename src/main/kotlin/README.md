@@ -1,8 +1,8 @@
 # Kotlin
 
 ## Overview
-Subsystem blueprint grouping child modules under `apps/mobile/android-remote/src/main/kotlin`.
+Subsystem blueprint grouping child modules under `apps/mobile/vitruvian-remote/src/main/kotlin`.
 
 ## Subdirectories & Boundaries
-- [dev](./dev/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/src/main/ko...
+- [dev](./dev/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/src/main/ko...
 

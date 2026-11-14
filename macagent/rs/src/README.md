@@ -1,7 +1,7 @@
 # Src
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macagent/rs/src`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macagent/rs/src`.
 
 ## Interface
 - `[antigravity.rs:AGY_IDLE_STATUS]`
@@ -50,4 +50,4 @@ Component package providing implementation for `apps/mobile/android-remote/macag
 - [http_util.rs:463]: `/// Serves a single HTTP connection.`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macagent/rs/src/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macagent/rs/src/...`

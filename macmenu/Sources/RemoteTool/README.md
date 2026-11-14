@@ -1,7 +1,7 @@
 # Remotetool
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/Sources/RemoteTool`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/Sources/RemoteTool`.
 
 ## Interface
 - Internal implementation components
@@ -13,4 +13,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/Sources/RemoteTool/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/Sources/RemoteTool/...`

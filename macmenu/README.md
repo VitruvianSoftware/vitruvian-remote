@@ -38,16 +38,16 @@ never shows it.
 ## Install
 
 ```sh
-bazel run --config=macos-app //apps/mobile/android-remote/macmenu:install
+bazel run --config=macos-app //apps/mobile/vitruvian-remote/macmenu:install
 ```
 
 That builds the app, puts it in `/Applications`, and opens it. Install the
-agent first with `//apps/mobile/android-remote/macagent:install`.
+agent first with `//apps/mobile/vitruvian-remote/macagent:install`.
 
 ## Tests
 
 ```sh
-bazel test --config=macos-app //apps/mobile/android-remote/macmenu:RemoteMenuTests //apps/mobile/android-remote/macmenu:paths_match_installer_test
+bazel test --config=macos-app //apps/mobile/vitruvian-remote/macmenu:RemoteMenuTests //apps/mobile/vitruvian-remote/macmenu:paths_match_installer_test
 ```
 
 The second test fails when the agent's installer and this app disagree about
@@ -55,5 +55,5 @@ where the agent lives, so the menu can't quietly report "not installed" about
 an agent that is running fine.
 
 ## Subdirectories & Boundaries
-- [Sources](./Sources/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/macmenu/Sou...
+- [Sources](./Sources/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/macmenu/Sou...
 

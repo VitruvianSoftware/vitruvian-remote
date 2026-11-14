@@ -792,7 +792,7 @@ public class WireTest {
 
   @Test
   public fun `golden state payload parses settings catalog choices limits outputs and target display_line`() {
-    val json = readRunfile("apps/mobile/android-remote/macagent/golden_speaker_v1.json")
+    val json = readRunfile("apps/mobile/vitruvian-remote/macagent/golden_speaker_v1.json")
     val s = VitruvianSpeakerWire.sources(json)
 
     assertEquals(39, s.settings.size)
@@ -919,7 +919,7 @@ public class WireTest {
   public fun `speaker parses homes selected stale hook fields appInstalled and ownerRunning and degrades quietly on older payloads`() {
     val golden =
         VitruvianSpeakerWire.sources(
-            readRunfile("apps/mobile/android-remote/macagent/golden_speaker_v1.json"))
+            readRunfile("apps/mobile/vitruvian-remote/macagent/golden_speaker_v1.json"))
     assertEquals(true, golden.appInstalled)
     assertEquals(true, golden.ownerRunning)
     assertEquals(

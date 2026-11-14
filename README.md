@@ -1,5 +1,7 @@
 # Vitruvian Remote
 
+Formerly **android-remote**. Releases up to 0.1.39 are tagged `android-remote-v*`; later ones are `vitruvian-remote-v*`.
+
 A remote control and observability console for a Mac, built in the
 [Vitruvian](../../../packages/design-system/README.md) design language and shaped for a
 foldable — specifically the Pixel 11 Pro Fold, folded, unfolded and in tabletop
@@ -54,8 +56,8 @@ packet but only reaches a Mac on the same LAN as the phone.
 
 ```sh
 export ANDROID_HOME=/path/to/android-sdk   # API 35 platform + build-tools
-bazel build //apps/mobile/android-remote:app
-adb install -r bazel-bin/apps/mobile/android-remote/app.apk
+bazel build //apps/mobile/vitruvian-remote:app
+adb install -r bazel-bin/apps/mobile/vitruvian-remote/app.apk
 ```
 
 The Android SDK is the one non-hermetic toolchain in this repo: Google does not
@@ -99,9 +101,9 @@ Pre-compiled release APKs with multi-ABI support (`arm64-v8a` and `x86_64`) and 
 
 - **Permanent Vanity Download:** [`vitruviansoftware.dev/downloads/latest/vitruvian-remote.apk`](https://vitruviansoftware.dev/downloads/latest/vitruvian-remote.apk)
 - **Downloads Portal:** [`vitruviansoftware.dev/downloads/#mobile`](https://vitruviansoftware.dev/downloads/#mobile)
-- **GitHub Releases:** [`VitruvianSoftware/vitruvian-core/releases?q=android-remote`](https://github.com/VitruvianSoftware/vitruvian-core/releases?q=android-remote)
+- **GitHub Releases:** [`VitruvianSoftware/vitruvian-core/releases?q=vitruvian-remote`](https://github.com/VitruvianSoftware/vitruvian-core/releases?q=vitruvian-remote)
 
-Releases are managed via release-please (`release-please-config.json`, `.release-please-manifest.json`) and automated via `.github/workflows/android-remote-release.yaml`. When a release PR merges on `main`, the workflow compiles the APK via `scripts/publish.sh` and attaches `VitruvianRemote-X.Y.Z.apk` to the tag.
+Releases are managed via release-please (`release-please-config.json`, `.release-please-manifest.json`) and automated via `.github/workflows/vitruvian-remote-release.yaml`. When a release PR merges on `main`, the workflow compiles the APK via `scripts/publish.sh` and attaches `VitruvianRemote-X.Y.Z.apk` to the tag.
 
 ## What is missing
 
@@ -113,7 +115,7 @@ Releases are managed via release-please (`release-please-config.json`, `.release
   written yet.
 - **Module gallery.** The "Xcode builds" module was removed (it was never wired).
   "Add by URL" was removed from the module gallery. "Install guide" opens
-  `apps/mobile/android-remote/macagent/README.md` on GitHub. Antigravity, Ollama,
+  `apps/mobile/vitruvian-remote/macagent/README.md` on GitHub. Antigravity, Ollama,
   Grafana, Docker, Lima, Sony TV, and Vitruvian Speaker are fully wired.
 - **Vitruvian Speaker.** (`Apps → Vitruvian Speaker`, backed by
   [`macagent/rs/src/speaker.rs`](macagent/rs/src/speaker.rs) and
@@ -136,8 +138,8 @@ and copy are final and token-derived; if a value here disagrees with
 `tokens.json`, `tokens.json` is right.
 
 ## Subdirectories & Boundaries
-- [macagent](./macagent/README.md): Contract for apps/mobile/android-remote/macagent
-- [macmenu](./macmenu/README.md): Contract for apps/mobile/android-remote/macmenu
-- [src](./src/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/src.
-- [tools](./tools/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/tools.
+- [macagent](./macagent/README.md): Contract for apps/mobile/vitruvian-remote/macagent
+- [macmenu](./macmenu/README.md): Contract for apps/mobile/vitruvian-remote/macmenu
+- [src](./src/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/src.
+- [tools](./tools/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/tools.
 

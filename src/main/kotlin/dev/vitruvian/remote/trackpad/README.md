@@ -1,7 +1,7 @@
 # Trackpad
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/trackpad`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/trackpad`.
 
 ## Interface
 - `[TrackpadGestures.kt:TrackpadHandlers]`
@@ -14,4 +14,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/trackpad/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/trackpad/...`

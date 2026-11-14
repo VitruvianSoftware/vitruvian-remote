@@ -1,7 +1,7 @@
 # Remote
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote`.
 
 ## Interface
 - `[MainActivity.kt:MainActivity]`
@@ -23,4 +23,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - [MainActivity.kt:33]: `import android.net.Uri`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/...`

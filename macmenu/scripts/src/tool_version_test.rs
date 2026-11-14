@@ -19,10 +19,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Rust port of `apps/mobile/android-remote/macmenu/tool/version_test.py`.
+//! Rust port of `apps/mobile/vitruvian-remote/macmenu/atrium-extension/version_test.py`.
 //!
-//! Verifies that the Vitruvian Remote extension version in `tool/vitruvian-tool.json`
-//! matches `Version.swift`, `Resources/Info.plist`, and `apps/mobile/android-remote/BUILD`,
+//! Verifies that the Vitruvian Remote extension version in `atrium-extension/vitruvian-tool.json`
+//! matches `Version.swift`, `Resources/Info.plist`, and `apps/mobile/vitruvian-remote/BUILD`,
 //! that `vitruvian-tool.json` is formatted in release-please's 2-space JSON layout,
 //! and that `release-please-config.json` lists all four versioned files in `extra-files`.
 
@@ -35,7 +35,7 @@ pub const REQUIRED_EXTRA_FILES: &[&str] = &[
     "BUILD",
     "macmenu/Sources/RemoteMenuCore/Version.swift",
     "macagent/rs/src/server.rs",
-    "macmenu/tool/vitruvian-tool.json",
+    "macmenu/atrium-extension/vitruvian-tool.json",
     "macmenu/Resources/Info.plist",
 ];
 
@@ -224,7 +224,7 @@ pub fn check_all_versions(
     let build_ver = build_version_line(build_text);
     if build_ver.as_deref() != Some(manifest_version) {
         problems.push(format!(
-            "android-remote/BUILD says {:?}, vitruvian-tool.json says {manifest_version}",
+            "vitruvian-remote/BUILD says {:?}, vitruvian-tool.json says {manifest_version}",
             build_ver
         ));
     }
@@ -287,24 +287,24 @@ fn find_runfile(rel: &str) -> PathBuf {
 #[test]
 fn live_tool_versions_and_release_please_config_in_sync() {
     let manifest = fs::read_to_string(find_runfile(
-        "apps/mobile/android-remote/macmenu/tool/vitruvian-tool.json",
+        "apps/mobile/vitruvian-remote/macmenu/atrium-extension/vitruvian-tool.json",
     ))
     .unwrap();
     let swift = fs::read_to_string(find_runfile(
-        "apps/mobile/android-remote/macmenu/Sources/RemoteMenuCore/Version.swift",
+        "apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenuCore/Version.swift",
     ))
     .unwrap();
     let server_rs = fs::read_to_string(find_runfile(
-        "apps/mobile/android-remote/macagent/rs/src/server.rs",
+        "apps/mobile/vitruvian-remote/macagent/rs/src/server.rs",
     ))
     .unwrap();
-    let build = fs::read_to_string(find_runfile("apps/mobile/android-remote/BUILD")).unwrap();
+    let build = fs::read_to_string(find_runfile("apps/mobile/vitruvian-remote/BUILD")).unwrap();
     let plist = fs::read_to_string(find_runfile(
-        "apps/mobile/android-remote/macmenu/Resources/Info.plist",
+        "apps/mobile/vitruvian-remote/macmenu/Resources/Info.plist",
     ))
     .unwrap();
     let rp_config = fs::read_to_string(find_runfile(
-        "apps/mobile/android-remote/release-please-config.json",
+        "apps/mobile/vitruvian-remote/release-please-config.json",
     ))
     .unwrap();
 
@@ -333,14 +333,16 @@ fn detects_mismatch_across_files() {
     let server_rs = "pub const VERSION: &str = \"0.1.17\"; // x-release-please-version\n";
     let build = "        \"versionName\": \"0.1.19\",  # x-release-please-version\n";
     let plist = "<plist><dict><key>CFBundleShortVersionString</key><string>0.1.18</string><key>CFBundleVersion</key><string>0.1.21</string></dict></plist>";
-    let rp = "{\"packages\": {\"apps/mobile/android-remote\": {\"extra-files\": []}}}";
+    let rp = "{\"packages\": {\"apps/mobile/vitruvian-remote\": {\"extra-files\": []}}}";
 
     let problems = check_all_versions(manifest, swift, server_rs, build, plist, rp);
     assert!(problems.iter().any(|p| p.contains("Version.swift")));
     assert!(problems
         .iter()
         .any(|p| p.contains("macagent/rs/src/server.rs")));
-    assert!(problems.iter().any(|p| p.contains("android-remote/BUILD")));
+    assert!(problems
+        .iter()
+        .any(|p| p.contains("vitruvian-remote/BUILD")));
     assert!(problems
         .iter()
         .any(|p| p.contains("CFBundleShortVersionString")));

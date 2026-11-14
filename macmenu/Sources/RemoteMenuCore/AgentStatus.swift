@@ -197,7 +197,7 @@ public enum PairCode {
 public struct AgentPaths: Sendable {
     public static let label = "com.vitruvian.remote-agent"
     public static let baseURL = URL(string: "http://127.0.0.1:7411")!
-    public static let installCommand = "bazel run //apps/mobile/android-remote/macagent:install"
+    public static let installCommand = "bazel run //apps/mobile/vitruvian-remote/macagent:install"
 
     public var home: URL
 

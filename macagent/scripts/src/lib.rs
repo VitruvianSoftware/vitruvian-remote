@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Rust ports of `apps/mobile/android-remote/macagent/install.sh` and `pair.sh`.
+//! Rust ports of `apps/mobile/vitruvian-remote/macagent/install.sh` and `pair.sh`.
 
 use std::env;
 use std::fs;
@@ -38,7 +38,7 @@ pub const PLIST_REL_DIR: &str = "Library/LaunchAgents";
 pub const SIGN_ID: &str = "Vitruvian Remote Agent";
 pub const BASE_URL: &str = "http://127.0.0.1:7411";
 pub const HEALTHZ_URL: &str = "http://127.0.0.1:7411/healthz";
-pub const RUNFILES_PKG_SUBDIR: &str = "_main/apps/mobile/android-remote/macagent";
+pub const RUNFILES_PKG_SUBDIR: &str = "_main/apps/mobile/vitruvian-remote/macagent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallerPaths {
@@ -211,7 +211,7 @@ pub fn run_pair(args: &[String]) -> i32 {
         Some(b) => b,
         None => {
             eprintln!(
-                "pair.sh: built agent not found under {} (run via: bazel run //apps/mobile/android-remote/macagent:pair -- <code>)",
+                "pair.sh: built agent not found under {} (run via: bazel run //apps/mobile/vitruvian-remote/macagent:pair -- <code>)",
                 src_dir.display()
             );
             return 1;
@@ -254,7 +254,7 @@ pub fn run_install(args: &[String]) -> i32 {
         Some(b) if plist_src.is_file() => b,
         _ => {
             eprintln!(
-                "install.sh: built agent or plist not found under {} (run via: bazel run //apps/mobile/android-remote/macagent:install)",
+                "install.sh: built agent or plist not found under {} (run via: bazel run //apps/mobile/vitruvian-remote/macagent:install)",
                 src_dir.display()
             );
             return 1;

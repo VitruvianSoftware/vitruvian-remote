@@ -1,7 +1,7 @@
 # Remotetoolcore
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/Sources/RemoteToolCore`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/Sources/RemoteToolCore`.
 
 ## Interface
 - `[Pages.swift:RemotePages]`
@@ -14,4 +14,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/Sources/RemoteToolCore/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/Sources/RemoteToolCore/...`

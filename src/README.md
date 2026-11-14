@@ -1,8 +1,8 @@
 # Src
 
 ## Overview
-Subsystem blueprint grouping child modules under `apps/mobile/android-remote/src`.
+Subsystem blueprint grouping child modules under `apps/mobile/vitruvian-remote/src`.
 
 ## Subdirectories & Boundaries
-- [main](./main/README.md): Subsystem blueprint grouping child modules under apps/mobile/android-remote/src/main.
+- [main](./main/README.md): Subsystem blueprint grouping child modules under apps/mobile/vitruvian-remote/src/main.
 

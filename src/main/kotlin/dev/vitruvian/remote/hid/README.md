@@ -1,7 +1,7 @@
 # Hid
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/hid`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/hid`.
 
 ## Interface
 - `[BluetoothHidTransport.kt:HidLinkState]`
@@ -16,4 +16,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/hid/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/hid/...`

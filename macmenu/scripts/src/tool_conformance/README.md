@@ -1,7 +1,7 @@
 # Tool Conformance
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/scripts/src/tool_conformance`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/scripts/src/tool_conformance`.
 
 ## Interface
 - `[lib.rs:TABS]`
@@ -25,4 +25,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - [lib.rs:268]: `let link = Link::spawn(&[program.to_string_lossy().into_owned()], &data)`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/scripts/src/tool_conformance/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/scripts/src/tool_conformance/...`

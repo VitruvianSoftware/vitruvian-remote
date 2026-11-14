@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Rust port of `apps/mobile/android-remote/macmenu/install.sh`.
+//! Rust port of `apps/mobile/vitruvian-remote/macmenu/install.sh`.
 
 use std::env;
 use std::fs;
@@ -32,8 +32,9 @@ pub const DEFAULT_DEST: &str = "/Applications";
 pub const APP_BUNDLE_NAME: &str = "VitruvianRemote.app";
 pub const APP_PROCESS_NAME: &str = "VitruvianRemote";
 pub const BUNDLE_ID: &str = "com.vitruviansoftware.remote";
-pub const ZIP_RUNFILES_REL: &str = "_main/apps/mobile/android-remote/macmenu/VitruvianRemote.zip";
-pub const AGENT_RUNFILES_REL: &str = "_main/apps/mobile/android-remote/macagent/macagent_/macagent";
+pub const ZIP_RUNFILES_REL: &str = "_main/apps/mobile/vitruvian-remote/macmenu/VitruvianRemote.zip";
+pub const AGENT_RUNFILES_REL: &str =
+    "_main/apps/mobile/vitruvian-remote/macagent/macagent_/macagent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPaths {
@@ -60,7 +61,7 @@ pub fn resolve_install_paths(
     let zip_path = runfiles.join(ZIP_RUNFILES_REL);
     let mut agent_path = runfiles.join(AGENT_RUNFILES_REL);
     if !agent_path.is_file() {
-        let rust_agent = runfiles.join("_main/apps/mobile/android-remote/macagent/macagent");
+        let rust_agent = runfiles.join("_main/apps/mobile/vitruvian-remote/macagent/macagent");
         if rust_agent.is_file() {
             agent_path = rust_agent;
         }
@@ -119,7 +120,7 @@ pub fn run(args: &[String]) -> i32 {
 
     if !paths.zip_path.is_file() {
         eprintln!(
-            "install.sh: built app not found at {} (run via: bazel run --config=macos-app //apps/mobile/android-remote/macmenu:install)",
+            "install.sh: built app not found at {} (run via: bazel run --config=macos-app //apps/mobile/vitruvian-remote/macmenu:install)",
             paths.zip_path.display()
         );
         return 1;
@@ -250,13 +251,13 @@ mod tests {
         assert_eq!(
             p.zip_path,
             PathBuf::from(
-                "/path/to/install.runfiles/_main/apps/mobile/android-remote/macmenu/VitruvianRemote.zip"
+                "/path/to/install.runfiles/_main/apps/mobile/vitruvian-remote/macmenu/VitruvianRemote.zip"
             )
         );
         assert_eq!(
             p.agent_path,
             PathBuf::from(
-                "/path/to/install.runfiles/_main/apps/mobile/android-remote/macagent/macagent_/macagent"
+                "/path/to/install.runfiles/_main/apps/mobile/vitruvian-remote/macagent/macagent_/macagent"
             )
         );
     }
@@ -276,7 +277,7 @@ mod tests {
         assert_eq!(
             p.zip_path,
             PathBuf::from(
-                "/tmp/custom-runfiles/_main/apps/mobile/android-remote/macmenu/VitruvianRemote.zip"
+                "/tmp/custom-runfiles/_main/apps/mobile/vitruvian-remote/macmenu/VitruvianRemote.zip"
             )
         );
     }

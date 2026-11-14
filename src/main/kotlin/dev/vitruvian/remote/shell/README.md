@@ -1,7 +1,7 @@
 # Shell
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/shell`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/shell`.
 
 ## Interface
 - `[Dock.kt:Dock]`
@@ -16,4 +16,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/shell/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/shell/...`

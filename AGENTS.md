@@ -1,6 +1,6 @@
-# Vitruvian Remote (android-remote) — agent guide
+# Vitruvian Remote (vitruvian-remote) — agent guide
 
-> Scoped to `apps/mobile/android-remote/`. Repo-wide rules live in the root
+> Scoped to `apps/mobile/vitruvian-remote/`. Repo-wide rules live in the root
 > [`AGENTS.md`](../../../AGENTS.md); the developer SOP is
 > [`CONTRIBUTING.md`](../../../CONTRIBUTING.md), which wins on any conflict. This app's own
 > [`CONTRIBUTING.md`](CONTRIBUTING.md) holds the house rules in full; this file is the short
@@ -19,25 +19,25 @@ no design value of its own.
 
 - **Toolchain.** The Android SDK is the one non-hermetic toolchain in the monorepo: set
   `ANDROID_HOME` to a local SDK with the API 35 platform and build-tools.
-  `bazel run //apps/mobile/android-remote:doctor` checks bazel and git only — it has no SDK probe;
-  `bazel build //apps/mobile/android-remote:app` fails with a clear message when `ANDROID_HOME`
+  `bazel run //apps/mobile/vitruvian-remote:doctor` checks bazel and git only — it has no SDK probe;
+  `bazel build //apps/mobile/vitruvian-remote:app` fails with a clear message when `ANDROID_HOME`
   is unset. The NDK is hermetic (`//tools/android_ndk`).
-- **Build and install.** `bazel build //apps/mobile/android-remote:app`, then
-  `adb install -r bazel-bin/apps/mobile/android-remote/app.apk`. For wireless debugging's
+- **Build and install.** `bazel build //apps/mobile/vitruvian-remote:app`, then
+  `adb install -r bazel-bin/apps/mobile/vitruvian-remote/app.apk`. For wireless debugging's
   ephemeral ports use `bazel run //tools/adb-connect`.
-- **Tests.** `bazel test //apps/mobile/android-remote/...` runs the `kt_jvm_test` targets
+- **Tests.** `bazel test //apps/mobile/vitruvian-remote/...` runs the `kt_jvm_test` targets
   (`hid_codes_test`, `format_test`, `derive_test`, `wire_test`, `wake_on_lan_test`,
   `bridge_policy_test`, `tuning_test`) and the `macagent` Rust tests (`:macagent_test`,
-  `:macagent_scripts_lib_test`, `//apps/mobile/android-remote/macagent/metrics:metrics_test`).
+  `:macagent_scripts_lib_test`, `//apps/mobile/vitruvian-remote/macagent/metrics:metrics_test`).
   `:boot_smoke` installs the APK on an attached device or emulator and launches
   `MainActivity`; it is `large` and needs that device, so run it by explicit label.
 - **Daemon.** `macagent/BUILD` carries the Rust binary (`:macagent`, built with rules_rust)
   plus its `install` and `pair` helpers (`:install`, `:pair`); the six-digit pairing code
   gates the macros, console and clipboard endpoints.
-- **Release and distribution.** Release-please cuts `android-remote-vX.Y.Z` on merge to `main`.
-  `.github/workflows/android-remote-release.yaml` packages the release APK with multi-ABI support
+- **Release and distribution.** Release-please cuts `vitruvian-remote-vX.Y.Z` on merge to `main`.
+  `.github/workflows/vitruvian-remote-release.yaml` packages the release APK with multi-ABI support
   via `scripts/publish.sh` and attaches `VitruvianRemote-X.Y.Z.apk` to GitHub Releases. A macOS
-  job runs `bazel run //apps/mobile/android-remote/macmenu:publish-tool`, which attaches `VitruvianRemote-X.Y.Z-tool.zip`,
+  job runs `bazel run //apps/mobile/vitruvian-remote/macmenu:publish-tool`, which attaches `VitruvianRemote-X.Y.Z-tool.zip`,
   the Mac extension as the Vitruvian catalog installs it (universal, ad hoc signed).
 
 ## House rules
@@ -67,7 +67,7 @@ no design value of its own.
 ## Vitruvian Speaker Parity Checklist
 
 When `apps/desktop/vitruvian-speaker` changes its config schema, secret store, or distribution doors,
-update `android-remote` in lockstep across these files:
+update `vitruvian-remote` in lockstep across these files:
 
 - **Source of truth in `apps/desktop/vitruvian-speaker/Sources/VitruvianSpeakerCore/`:**
   - `Models.swift` (`SpeakerConfig`, `SpeechLength`, `LocalSpeechEngine`, `GeminiVoice`,
@@ -75,7 +75,7 @@ update `android-remote` in lockstep across these files:
   - `Door.swift` & `Profile.swift` (`~/.gemini/speaker_door.json` active door resolution,
     `ToolData/dev.vitruvian.speaker/{settings.json,history.json,secrets.json,running.lock}`)
   - `SecretStore.swift` (`secrets.json` `google.refreshToken` and `geminiAPIKey`)
-- **Counterparts in `apps/mobile/android-remote/`:**
+- **Counterparts in `apps/mobile/vitruvian-remote/`:**
   1. `macagent/rs/src/speaker.rs` & `macagent_test` (`active_program()`, `state()`,
      `plan_ops()`, `apply()`, `handle_say`, `handle_phone_say`, `run_volume`, `speak_phone`,
      `phone_pause_media`, `phone_headphones_only`)

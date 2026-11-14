@@ -955,7 +955,7 @@ mod tests {
         for candidate in [
             format!("testdata/{}", name),
             format!(
-                "apps/mobile/android-remote/macagent/metrics/testdata/{}",
+                "apps/mobile/vitruvian-remote/macagent/metrics/testdata/{}",
                 name
             ),
         ] {
@@ -965,7 +965,7 @@ mod tests {
         }
         if let Ok(srcdir) = std::env::var("TEST_SRCDIR") {
             let p = format!(
-                "{}/_main/apps/mobile/android-remote/macagent/metrics/testdata/{}",
+                "{}/_main/apps/mobile/vitruvian-remote/macagent/metrics/testdata/{}",
                 srcdir, name
             );
             if let Ok(s) = std::fs::read_to_string(&p) {

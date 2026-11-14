@@ -360,7 +360,7 @@ private fun PairPlate(state: RemoteState) {
           // can run. The phone invents the code; the Mac is told what it is.
           text =
               "Easiest: on the Mac, choose Pair with QR Code from the V menu and scan it. " +
-                  "Or run: bazel run //apps/mobile/android-remote/macagent:pair -- " +
+                  "Or run: bazel run //apps/mobile/vitruvian-remote/macagent:pair -- " +
                   state.pairDigits,
           style = VitruvianType.body.copy(fontSize = VitruvianType.mono.fontSize),
           color = colors.textDim,

@@ -1,7 +1,7 @@
 # Install
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macmenu/scripts/src/install`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macmenu/scripts/src/install`.
 
 ## Interface
 - `[lib.rs:DEFAULT_DEST]`
@@ -22,4 +22,4 @@ Component package providing implementation for `apps/mobile/android-remote/macme
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macmenu/scripts/src/install/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macmenu/scripts/src/install/...`

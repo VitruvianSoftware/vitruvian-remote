@@ -40,7 +40,7 @@ the first 80 characters, so the Mac has a record of what the phone did.
 ## Pairing
 
 1. The **phone** shows a random six-digit code with a five-minute TTL.
-2. On the **Mac**: `bazel run //apps/mobile/android-remote/macagent:pair -- 482917`
+2. On the **Mac**: `bazel run //apps/mobile/vitruvian-remote/macagent:pair -- 482917`
    (the binary's `pair` subcommand). Writes `~/.config/vitruvian-remote-agent/pair.json`
    `{"code":"482917","expires":"<RFC3339 +5m>","attempts":0}`.
 3. The phone polls `POST /v1/pair {"code":"482917"}` every tick until it gets
@@ -213,7 +213,7 @@ cannot contradict the switch.
 ## New flags
 
 `--ntfy-url`, `--ntfy-topic`, `--ntfy-token-file`, `--gh-extra-repos`, `--exec-dir` (the cwd for
-`/v1/exec` and `/v1/exec/stream`; under launchd it is otherwise `~`, where `bazel run` has no workspace). `bazel run //apps/mobile/android-remote/macagent:install` passes them
+`/v1/exec` and `/v1/exec/stream`; under launchd it is otherwise `~`, where `bazel run` has no workspace). `bazel run //apps/mobile/vitruvian-remote/macagent:install` passes them
 through like the others.
 
 ## Phone-only (no agent change)
@@ -293,7 +293,7 @@ so a tailnet peer learns nothing about whether it guessed one.
 # Vitruvian Speaker (v1.4 and later)
 
 The full Vitruvian Speaker contract (`/v1/speaker`, `/v1/speaker/say`, `/v1/speaker/volume`)
-is in [`macagent/API.md`](https://github.com/VitruvianSoftware/vitruvian-core/blob/main/apps/mobile/android-remote/macagent/API.md).
+is in [`macagent/API.md`](https://github.com/VitruvianSoftware/vitruvian-core/blob/main/apps/mobile/vitruvian-remote/macagent/API.md).
 The newest additions are repeated here.
 
 ## v1.10 additions: Vitruvian Speaker sources and replay

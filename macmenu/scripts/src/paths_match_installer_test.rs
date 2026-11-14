@@ -73,8 +73,9 @@ fn find_runfile(rel: &str) -> PathBuf {
 
 #[test]
 fn live_installer_and_swift_paths_match() {
-    let swift_path =
-        find_runfile("apps/mobile/android-remote/macmenu/Sources/RemoteMenuCore/AgentStatus.swift");
+    let swift_path = find_runfile(
+        "apps/mobile/vitruvian-remote/macmenu/Sources/RemoteMenuCore/AgentStatus.swift",
+    );
     let swift_text = fs::read_to_string(&swift_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", swift_path.display()));
 

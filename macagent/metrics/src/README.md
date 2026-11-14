@@ -1,7 +1,7 @@
 # Src
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/macagent/metrics/src`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/macagent/metrics/src`.
 
 ## Interface
 - `[argocd.rs:ArgoApp]`
@@ -37,4 +37,4 @@ Component package providing implementation for `apps/mobile/android-remote/macag
 - None
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/macagent/metrics/src/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/macagent/metrics/src/...`

@@ -20,5 +20,5 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    std::process::exit(android_remote_tools_lib::boot_smoke::run(&args));
+    std::process::exit(vitruvian_remote_tools_lib::boot_smoke::run(&args));
 }

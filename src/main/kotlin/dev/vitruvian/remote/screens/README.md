@@ -1,7 +1,7 @@
 # Screens
 
 ## Overview
-Component package providing implementation for `apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/screens`.
+Component package providing implementation for `apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/screens`.
 
 ## Interface
 - `[AppsScreen.kt:ColumnScope]`
@@ -22,4 +22,4 @@ Component package providing implementation for `apps/mobile/android-remote/src/m
 - [MacScreen.kt:331]: `VButton("Query", state::runPromql)`
 
 ## Verification
-- Run: `bazel test //apps/mobile/android-remote/src/main/kotlin/dev/vitruvian/remote/screens/...`
+- Run: `bazel test //apps/mobile/vitruvian-remote/src/main/kotlin/dev/vitruvian/remote/screens/...`
